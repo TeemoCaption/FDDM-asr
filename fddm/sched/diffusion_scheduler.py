@@ -8,8 +8,6 @@
 #  - T (int): 擴散總步數（訓練建議 200）
 #  - beta_max (float): cos 排程的上限幅度（可先 0.2）
 #  - device: torch 裝置
-# 備註：
-#  - 需安裝 torch
 
 # 低記憶體版：不建立 T×K×K；用 (1-β)I + (β/K)11^T 的封閉解。
 import math

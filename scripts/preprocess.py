@@ -6,7 +6,7 @@ import os  # 用於檔案路徑操作
 import json  # 用於處理JSON格式資料
 import pandas as pd  # 用於資料處理和CSV輸出
 import librosa  # 用於音檔處理，如resample
-import soundfile as sf  # 新增：統一於頂部匯入soundfile，負責WAV等音檔的讀寫，避免在函式內重複匯入
+import soundfile as sf  # 統一於頂部匯入soundfile，負責WAV等音檔的讀寫，避免在函式內重複匯入
 import re  # 用於文本正規化
 
 # 設定資料集版本和語言
