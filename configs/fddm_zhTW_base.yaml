@@ -13,8 +13,9 @@ data:
   max_seconds: 20
   pad_id: 0
   # 修正為實際的資料路徑（需先執行前處理）
-  manifest_train: data/processed/index.json
-  manifest_dev:   data/processed/index.json  # 目前使用同一份資料，可後續分割
+  manifest_train: data/processed/train.json
+  manifest_dev:   data/processed/dev.json
+  manifest_test:  data/processed/test.json  # 測試集路徑
   # tokenizer 參數（與 tokenizer_zhTW.yaml 對齊）
   vocab_size: 8000
 

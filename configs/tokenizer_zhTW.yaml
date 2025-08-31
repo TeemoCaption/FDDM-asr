@@ -2,11 +2,12 @@
 # 目的：為 zh-TW（A 案：已在前處理移除括號內羅馬字）訓練 SentencePiece tokenizer 的設定
 
 corpus:
-  # 讀取由 preprocess.py 產生的索引檔（請先跑完 preprocess.py）
+  # 讀取由 preprocess.py 產生的完整索引檔（請先跑完 preprocess.py）
+  # 使用完整資料集訓練 tokenizer，確保詞彙表涵蓋所有分割
   index_csv: "data/processed/index.csv"   # 來源語料檔（欄位 normalized_sentence）
   text_field: "normalized_sentence"       # 用來訓練 tokenizer 的欄位
   min_len: 1                              # 句子最小長度（過短的句子會濾掉）
-  max_len: 300                            # 句子最大長度（對齊論文評估上限）
+  max_len: null                           # 不限制句子最大長度
 
 tokenizer:
   type: "sentencepiece"                   # 目前支援 sentencepiece
