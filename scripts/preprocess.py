@@ -122,8 +122,7 @@ def generate_index(extract_dir):
     # 正規化文本
     df['normalized_sentence'] = df['sentence'].apply(normalize_text)
     df['len_text'] = df['normalized_sentence'].apply(len)  # 計算文本長度
-    # 過濾長度<300的樣本（根據路線圖）
-    df = df[df['len_text'] < 300]
+    # 不過濾任何樣本，保留所有資料
     # 設定處理後音檔路徑
     df['processed_path'] = df['path'].apply(lambda x: os.path.join(PROCESSED_DATA_DIR, "clips", x))  # 直接使用WAV檔名建立處理後路徑
     # 創建clips目錄
