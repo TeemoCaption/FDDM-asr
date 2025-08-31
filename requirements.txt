@@ -1,0 +1,4 @@
+pandas
+librosa
+datasets<4.0.0
+soundfile
