@@ -1,0 +1,60 @@
+# FDDM-asr 主要訓練設定（最小可跑）
+# 論文對照：
+# - WavLM-large 作為 frozen acoustic encoder（3.1 節）
+# - Transformer-based denoising decoder 非自回歸（3.1 節）
+# - Cosine β_t（8）由你的 DiscreteDiffusionScheduler 控制
+# - 每 n_step_fd 次將 L_fd 併入總損失（3.3 節）
+
+seed: 1337
+
+# ==== Data ====
+data:
+  sample_rate: 16000
+  max_seconds: 20
+  pad_id: 0
+  # 修正為實際的資料路徑（需先執行前處理）
+  manifest_train: data/processed/index.json
+  manifest_dev:   data/processed/index.json  # 目前使用同一份資料，可後續分割
+  # tokenizer 參數（與 tokenizer_zhTW.yaml 對齊）
+  vocab_size: 8000
+
+# ==== Model ====
+model:
+  d_model: 768
+  nhead: 12
+  num_layers: 6
+  dim_ff: 2048
+  dropout: 0.1
+  encoder:
+    wavlm_name: microsoft/wavlm-large
+    freeze: true
+    proj: linear
+    pooling: none
+  projector:
+    d_proj: 256
+
+# ==== Diffusion / Scheduler ====
+diffusion:
+  T: 200            # 訓練步數，與論文一致
+  beta_max: 0.2     # cosine 排程的噪聲上限，可在 0.1~0.3 間微調
+  # 其餘如 β_t, M_t 由 DiscreteDiffusionScheduler 提供
+
+# ==== Optimization ====
+optim:
+  batch_size: 4
+  lr: 2.0e-4
+  weight_decay: 0.01
+  num_epochs: 10
+  grad_accum_steps: 1
+  warmup_steps: 1000
+
+# ==== Feature Decorrelation (L_fd) ====
+lfd:
+  lambda_offdiag: 1.0
+  n_step_fd: 4      # 每 4 步加入一次 L_fd（論文 3.3 的「每 n 次 iteration」）
+  tau: 1.0          # 論文中的 τ（可先設 1.0）
+
+# ==== Logging / Checkpoint ====
+log:
+  log_every: 50
+  ckpt_dir: ckpts/fddm_zhTW_base
