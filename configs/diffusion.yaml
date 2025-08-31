@@ -1,0 +1,5 @@
+# configs/diffusion.yaml
+diffusion:
+  T: 200        # 訓練總步數（論文設定）
+  beta_max: 0.2 # 噪聲上限，可在 0.1~0.3 間微調
+  device: "cuda"
