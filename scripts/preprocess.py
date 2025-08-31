@@ -27,55 +27,88 @@ os.makedirs(PROCESSED_DATA_DIR, exist_ok=True)  # 如果processed目錄不存在
 
 def download_dataset():
     """
-    下載 Common Voice 資料集從Hugging Face
+    下載 Common Voice 資料集從 Hugging Face，使用內建的分割
     """
-    print("開始下載 zh-TW 資料集從Hugging Face...")  # 提示使用者目前正在開始下載資料集，便於追蹤流程
-    from datasets import load_dataset  # 從datasets套件匯入load_dataset函式，用於載入Hugging Face上的資料集
-    
-    # 使用新的方式載入資料集，避免使用舊版script-based載入
+    print("開始下載 zh-TW 資料集從 Hugging Face (使用內建分割)...")
+    from datasets import load_dataset
+
+    # 使用 Hugging Face 內建的分割
     dataset = load_dataset(
-        "mozilla-foundation/common_voice_16_1",  # 指定資料集倉庫ID，對應Common Voice 16.1版本
-        "zh-TW",  # 指定語言子集為繁體中文台灣
-        split="train",  # 明確指定載入train split
-        cache_dir=RAW_DATA_DIR,  # 指定快取目錄為專案的raw資料夾，方便管理與重複利用
-        trust_remote_code=True  # 信任遠端代碼，避免因代碼問題而無法載入
+        "mozilla-foundation/common_voice_16_1",
+        "zh-TW",
+        split=["train", "validation", "test"],  # 使用內建的 train/validation/test 分割
+        cache_dir=RAW_DATA_DIR,
+        trust_remote_code=True
     )
-    print("下載完成")  # 提示下載動作已完成
-    return {"train": dataset}  # 為了與extract_dataset()中使用dataset['train']的介面相容，將Dataset包成字典回傳
+
+    print("下載完成")
+    print(f"  訓練集: {len(dataset[0])} 樣本")
+    print(f"  開發集: {len(dataset[1])} 樣本")
+    print(f"  測試集: {len(dataset[2])} 樣本")
+
+    # 返回字典格式以保持與現有程式碼的兼容性
+    return {
+        "train": dataset[0],
+        "validation": dataset[1],
+        "test": dataset[2]
+    }
 
 def extract_dataset(dataset):
     """
-    處理Hugging Face資料集
+    處理 Hugging Face 資料集，使用內建分割
     """
     extract_dir = os.path.join(RAW_DATA_DIR, LANGUAGE)
     os.makedirs(extract_dir, exist_ok=True)
-    # 創建clips目錄
-    clips_dir = os.path.join(extract_dir, "clips")
-    os.makedirs(clips_dir, exist_ok=True)
-    # 處理train set
-    train_data = []
-    for item in dataset['train']:
-        # 取得來源音檔在快取中的路徑（通常為.mp3），後續僅用其檔名基底來生成WAV檔名
-        audio_path = item['audio']['path']  # 從Hugging Face項目中取得音訊的原始檔案路徑（多半是快取中的mp3）
-        # 從來源檔名萃取不含副檔名的基底名稱，準備生成對應的WAV檔名
-        base_name = os.path.splitext(os.path.basename(audio_path))[0]  # 取得例如"xyz"而非"xyz.mp3"，以便後續改存為WAV
-        # 組合WAV輸出完整路徑，確保以.wav為副檔名，避免以.mp3副檔名寫入導致失敗
-        wav_filename = f"{base_name}.wav"  # 明確指定輸出檔名為WAV格式
-        wav_output_path = os.path.join(clips_dir, wav_filename)  # 建立WAV輸出完整路徑，放在extract的clips資料夾
-        # 將記憶體中的音訊array以WAV格式寫出，取樣率採用資料集中提供的sampling_rate
-        sf.write(wav_output_path, item['audio']['array'], item['audio']['sampling_rate'])  # 使用soundfile寫出WAV，避免使用棄用API
-        # 收集標註資料，path欄位改為WAV檔名，確保後續流程一致
-        train_data.append({  # 建立一筆資料列，包含WAV檔名與文本與client_id等資訊
-            'path': wav_filename,  # 使用剛輸出的WAV檔名，後續不需要再做副檔名替換
-            'sentence': item['sentence'],  # 原始語句內容
-            'client_id': item['client_id']  # 說話者ID
-        })
-    # 保存tsv
-    import pandas as pd
-    df = pd.DataFrame(train_data)
-    df.to_csv(os.path.join(extract_dir, "train.tsv"), sep='\t', index=False)
-    print("處理完成")
-    return extract_dir
+
+    # 為每個分割建立目錄
+    splits_data = {}
+
+    for split_name in ["train", "validation", "test"]:
+        print(f"處理 {split_name} 分割...")
+
+        # 建立分割專用目錄
+        split_dir = os.path.join(extract_dir, split_name)
+        clips_dir = os.path.join(split_dir, "clips")
+        os.makedirs(clips_dir, exist_ok=True)
+
+        # 處理當前分割的資料
+        split_data = []
+        split_dataset = dataset[split_name]
+
+        for item in split_dataset:
+            # 取得來源音檔在快取中的路徑
+            audio_path = item['audio']['path']
+            # 從來源檔名萃取不含副檔名的基底名稱
+            base_name = os.path.splitext(os.path.basename(audio_path))[0]
+            # 組合WAV輸出完整路徑
+            wav_filename = f"{base_name}.wav"
+            wav_output_path = os.path.join(clips_dir, wav_filename)
+
+            # 將記憶體中的音訊array以WAV格式寫出
+            sf.write(wav_output_path, item['audio']['array'], item['audio']['sampling_rate'])
+
+            # 收集標註資料
+            split_data.append({
+                'path': wav_filename,
+                'sentence': item['sentence'],
+                'client_id': item['client_id']
+            })
+
+        # 保存分割的 TSV 檔案
+        import pandas as pd
+        df = pd.DataFrame(split_data)
+        tsv_path = os.path.join(split_dir, f"{split_name}.tsv")
+        df.to_csv(tsv_path, sep='\t', index=False)
+
+        splits_data[split_name] = {
+            'dir': split_dir,
+            'tsv': tsv_path,
+            'data': split_data
+        }
+
+        print(f"{split_name} 分割處理完成: {len(split_data)} 樣本")
+
+    return splits_data
 
 def normalize_text(text):
     """
@@ -105,125 +138,63 @@ def process_audio(audio_path, output_path):
     # 保存處理後的音檔
     sf.write(output_path, y_resampled, 16000)  # 改用soundfile寫出WAV，避免使用已棄用的librosa.output.write_wav
 
-def split_dataset(df, train_ratio=0.8, dev_ratio=0.1, test_ratio=0.1, random_seed=42):
+def generate_index(splits_data):
     """
-    將資料集分割為訓練集、開發集和測試集
+    生成資料索引（JSON和CSV格式），使用 Hugging Face 內建分割
     """
-    import numpy as np
-    np.random.seed(random_seed)  # 設定隨機種子以確保可重現性
-    
-    # 確保比例總和為1
-    assert abs(train_ratio + dev_ratio + test_ratio - 1.0) < 1e-6, "比例總和必須為1"
-    
-    # 按說話者分組，確保同一說話者的資料不會跨集合
-    speaker_groups = df.groupby('client_id')
-    speakers = list(speaker_groups.groups.keys())
-    np.random.shuffle(speakers)  # 隨機打亂說話者順序
-    
-    # 計算每個集合的說話者數量
-    n_speakers = len(speakers)
-    n_train = int(n_speakers * train_ratio)
-    n_dev = int(n_speakers * dev_ratio)
-    
-    # 分配說話者到不同集合
-    train_speakers = speakers[:n_train]
-    dev_speakers = speakers[n_train:n_train + n_dev]
-    test_speakers = speakers[n_train + n_dev:]
-    
-    # 根據說話者分割資料
-    train_df = df[df['client_id'].isin(train_speakers)].copy()
-    dev_df = df[df['client_id'].isin(dev_speakers)].copy()
-    test_df = df[df['client_id'].isin(test_speakers)].copy()
-    
-    print(f"資料集分割完成：")
-    print(f"  訓練集：{len(train_df)} 樣本，{len(train_speakers)} 說話者")
-    print(f"  開發集：{len(dev_df)} 樣本，{len(dev_speakers)} 說話者")
-    print(f"  測試集：{len(test_df)} 樣本，{len(test_speakers)} 說話者")
-    
-    return train_df, dev_df, test_df
+    for split_name, split_info in splits_data.items():
+        print(f"生成 {split_name} 分割的索引...")
 
-def generate_index(extract_dir):
-    """
-    生成資料索引（JSON和CSV格式），並分割為訓練/開發/測試集
-    """
-    # 讀取tsv檔案（Common Voice的標註檔案）
-    tsv_path = os.path.join(extract_dir, "train.tsv")
-    if not os.path.exists(tsv_path):
-        raise FileNotFoundError(f"找不到標註檔案：{tsv_path}")
-    # 讀取TSV（使用pandas）
-    df = pd.read_csv(tsv_path, sep='\t')
-    # 不再需要將.mp3替換為.wav，因為在extract階段已直接輸出為WAV檔名
-    # 過濾訓練資料（根據路線圖，只取path, sentence, client_id等）
-    df = df[['path', 'sentence', 'client_id']].copy()  # 選擇必要欄位並複製
-    df = df.dropna()  # 移除空值
-    # 正規化文本
-    df['normalized_sentence'] = df['sentence'].apply(normalize_text)
-    df['len_text'] = df['normalized_sentence'].apply(len)  # 計算文本長度
-    
-    print(f"總樣本數：{len(df)}")
-    
-    # 設定處理後音檔路徑
-    df['processed_path'] = df['path'].apply(lambda x: os.path.join(PROCESSED_DATA_DIR, "clips", x))  # 直接使用WAV檔名建立處理後路徑
-    # 創建clips目錄
-    os.makedirs(os.path.join(PROCESSED_DATA_DIR, "clips"), exist_ok=True)
-    
-    # 處理每個音檔
-    for idx, row in df.iterrows():
-        original_path = os.path.join(extract_dir, "clips", row['path'])  # 組合原始WAV音檔的完整路徑
-        processed_path = row['processed_path']  # 取出處理後輸出目的路徑
-        if os.path.exists(original_path):  # 檢查原始檔案是否存在，避免因缺檔而拋出例外
-            process_audio(original_path, processed_path)  # 呼叫音檔處理流程（重取樣等）並寫出至處理後路徑
-        else:
-            print(f"音檔不存在：{original_path}")  # 若檔案不存在，提示以利除錯
-    
-    # 分割資料集
-    train_df, dev_df, test_df = split_dataset(df)
-    
-    # 保存各個分割的資料集
-    datasets = {
-        'train': train_df,
-        'dev': dev_df,
-        'test': test_df
-    }
-    
-    saved_paths = []
-    for split_name, split_df in datasets.items():
-        # 保存為JSON
-        index_data = split_df.to_dict('records')
+        split_dir = split_info['dir']
+        tsv_path = split_info['tsv']
+        split_data = split_info['data']
+
+        # 讀取分割的 TSV 檔案
+        df = pd.read_csv(tsv_path, sep='\t')
+
+        # 正規化文本
+        df['normalized_sentence'] = df['sentence'].apply(normalize_text)
+        df['len_text'] = df['normalized_sentence'].apply(len)  # 計算文本長度
+
+        # 設定處理後音檔路徑
+        clips_dir = os.path.join(split_dir, "clips")
+        df['processed_path'] = df['path'].apply(lambda x: os.path.join(PROCESSED_DATA_DIR, "clips", f"{split_name}_{x}"))
+
+        # 處理每個音檔
+        for idx, row in df.iterrows():
+            original_path = os.path.join(clips_dir, row['path'])
+            processed_path = row['processed_path']
+
+            if os.path.exists(original_path):
+                process_audio(original_path, processed_path)
+            else:
+                print(f"音檔不存在：{original_path}")
+
+        # 保存為 JSON
+        index_data = df.to_dict('records')
         json_path = os.path.join(PROCESSED_DATA_DIR, f"{split_name}.json")
         with open(json_path, 'w', encoding='utf-8') as f:
             json.dump(index_data, f, ensure_ascii=False, indent=4)
-        
-        # 保存為CSV
+
+        # 保存為 CSV
         csv_path = os.path.join(PROCESSED_DATA_DIR, f"{split_name}.csv")
-        split_df.to_csv(csv_path, index=False, encoding='utf-8')
-        
-        saved_paths.extend([json_path, csv_path])
-        print(f"{split_name} 集合檔案生成：{json_path} 和 {csv_path}")
-    
-    # 同時保存完整資料集（向後相容）
-    complete_data = df.to_dict('records')
-    complete_json = os.path.join(PROCESSED_DATA_DIR, "index.json")
-    with open(complete_json, 'w', encoding='utf-8') as f:
-        json.dump(complete_data, f, ensure_ascii=False, indent=4)
-    complete_csv = os.path.join(PROCESSED_DATA_DIR, "index.csv")
-    df.to_csv(complete_csv, index=False, encoding='utf-8')
-    saved_paths.extend([complete_json, complete_csv])
-    
-    print(f"完整資料集檔案生成：{complete_json} 和 {complete_csv}")
-    return saved_paths
+        df.to_csv(csv_path, index=False, encoding='utf-8')
+
+        print(f"{split_name} 索引檔案生成完成: {json_path}, {csv_path}")
+
+    return list(splits_data.keys())
 
 def main():
     """
     主函數：執行整個前處理流程
     """
     print("開始前處理 Common Voice 16.1 zh-TW 資料集...")
-    # 1. 下載資料集
+    # 1. 下載資料集（使用內建分割）
     dataset = download_dataset()
     # 2. 處理資料集
-    extract_dir = extract_dataset(dataset)
+    splits_data = extract_dataset(dataset)
     # 3. 生成索引並處理資料
-    generate_index(extract_dir)
+    generate_index(splits_data)
     print("前處理完成！")
 
 if __name__ == "__main__":

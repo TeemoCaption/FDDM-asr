@@ -14,8 +14,8 @@ data:
   pad_id: 0
   # 修正為實際的資料路徑（需先執行前處理）
   manifest_train: data/processed/train.json
-  manifest_dev:   data/processed/dev.json
-  manifest_test:  data/processed/test.json  # 測試集路徑
+  manifest_dev:   data/processed/validation.json  # 使用 Hugging Face 內建的 validation 分割
+  manifest_test:  data/processed/test.json  # 使用 Hugging Face 內建的 test 分割
   # tokenizer 參數（與 tokenizer_zhTW.yaml 對齊）
   vocab_size: 8000
 
