@@ -1,0 +1,149 @@
+英文復刻：LibriSpeech（train-960, dev/test clean/other）。論文在實驗時只取「轉寫長度 < 300」的樣本做評估，訓練總步數 T=200（訓練階段）。
+
+中文/台語（你未來要做的）：Common Voice zh-TW / nan-tw。先決定是否保留括號羅馬字（建議兩種版本都試：A. 移除括號內羅馬字；B. 將羅馬字轉為獨立 token 流以利對齊與子詞學習）。
+
+前處理：音檔 resample、轉單聲道；文本正規化（大小寫、標點、數字規則）。
+
+產生資料索引（JSON/CSV）：包含 path、text、len_text、speaker 等。
+
+建字彙表／Tokenizer（決定離散狀態數 K）
+
+英文：BPE（SentencePiece）或 WordPiece；實驗對 WER 友善。
+
+中文/台語：建議用「中文字/符號 + 羅馬字子詞」的合併詞表；或純中文字詞表（簡單、穩定），K 大小 2–10 萬皆可，先從 8k–16k 起。
+
+輸出：一組 tokenizer（含 pad、bos、eos、unk），這些類別就是擴散的 K 類別。
+
+構好條件：凍結聲學編碼器
+
+使用 WavLM-Large（論文設定），凍結參數，將輸入語音 s → 高階表徵 c ∈ ℝ^{N×D} 作為條件（condition）。
+
+時長對齊：可用下採樣（或 conv/subsampling）讓 N 在可接受範圍；後續由解碼器以 cross-attention 讀取 c（論文採「跨模態 cross-attention 作為通用 conditioning」的精神）。
+
+去噪解碼器（Transformer Decoder）
+
+架構：多層 Transformer decoder（含自注意力 + 對 c 的 cross-attention）＋詞嵌入與位置編碼。
+
+參數量目標約 2.5e8（論文解碼器 253M 參數）；若先做可跑版，可從 100–150M 起步，再放大。
+
+輸入：在擴散第 t 步的離散樣本 x_t（one-hot 或 logits 對應的嵌入），外加步數 t 的時間編碼（sinusoidal / learned embedding），以及條件 c。
+
+輸出：對 x̂_0 的預測（每個位置對 K 類別的分佈），供後續 posterior 計算與反向轉移。
+
+建立離散擴散流程（multinomial diffusion）
+
+前向擴散（訓練取樣用）：q(x_t | x_0) = Cat(p = M^t x_0)，其中 M_t 為「均勻轉移矩陣」；β_t 用 cosine 噪聲排程。
+
+反向去噪：p_θ(x_{t-1}| x_t, c) 以模型預測的 x̂_0 近似前向後驗 q(x_{t-1}| x_t, x̂_0)；逐步（或跳步）還原到 x_0。
+
+這部分對應論文第 2 節（離散擴散）、第 3.1 節（條件式 VB 目標），以及均勻 M_t、cosine β_t 的設計。
+
+定義訓練目標（損失）
+
+條件式變分下界 L_cvb：在每個 t，最小化 KL[q(x_{t-1}|x_t, x_0) || p_θ(x_{t-1}|x_t, c)]，用模型輸出的 x̂_0 來計算 posterior。
+
+跨模態特徵去相關 L_fd（Barlow Twins 風格）：
+
+語音側：對 c 經 h_ϕa（MLP/投影頭）→ z_a；
+
+文字側：把 x̂_0 經詞嵌入 g_ω，再經 h_ϕb → z_b；
+
+計算跨相關矩陣 C = Z̃_a^⊤ Z̃_b（batch 標準化後），最小化 (1−C_ii)^2 + λ∑_{i≠j} C_ij^2。
+
+總損失：L_total = L_cvb + ∑{t=1}^T w_t · L_fd(t)，權重 w_t = ∏{s=1}^t (1−β_s)，可再乘一個縮放 τ；論文也採「每 n 次 iteration 才併入 L_fd」的策略（超參 n）。
+
+這對應論文第 3.2–3.3 節與 Algorithm 1。
+
+取樣與解碼（推論）
+
+Jumpy Sampling：每次從 t 跳 r 個步長，用 q(x_{t−r}|x_t, x̂_0) 來近似 r 步反向轉移（大幅降延遲）；對應 Algorithm 2。
+
+Greedy 解碼：每步只取機率最高的 x̂_0 來估 posterior（MAP 近似），簡化計算。
+
+設定：推論 T 可小於訓練 T（例如訓練 T=200，推論用 T=20，再配 r=2 或 r=5 觀察 WER vs 延遲折衷）。
+
+評測與記錄
+
+英文復刻：計算 WER（dev/test clean/other）。論文顯示在 LibriSpeech test-clean 可達約 4.0% WER，且在 test-other 噪聲集也具競爭力，尤其搭配 jumpy sampling 幾乎不犧牲太多 WER 就能大幅降推論時間。
+
+中文/台語：計算 CER 與 WER 皆可（中文常用 CER，若用子詞則 WER 也合理）。
+
+寫好實驗卡（configs + 日誌 + 版本）以利重現。
+
+針對 zh-TW / nan-tw 的客製化步驟
+
+文本正規化策略比英文更關鍵：
+
+A 案：去除括號羅馬字，只保留漢字 → 較簡單，CER/字級 diffusion 清晰。
+
+B 案：保留括號羅馬字，將羅馬字以子詞處理 → 有助台語發音對齊，但詞表與長度會增加。
+
+詞表 K 的選擇：建議先做「中文字為主 + 基礎標點」的版本（K≈5k–10k），之後再擴充含羅馬字的版本比對。
+
+音檔分段：Common Voice 片段通常較短，N（聲學時間步）會比 LibriSpeech 小，cross-attention 設計可相同。
+
+評測以 CER 為主，另報混合語料（中/台）時的分語言成績，以觀察跨語言對齊是否受 L_fd 幫助。
+
+超參與實作預設（可作為第一版 baseline）
+
+擴散步數：訓練 T=200；推論 T=20（先不 jump，再逐步開 r）。
+
+β_t：cosine 排程。
+
+詞向量維度 d_model：1024（可往上調至 1280/1536）；解碼層數 16–24；前饋維度 4096–6144；多頭注意力 16–24。
+
+投影頭 h_ϕa, h_ϕb：2–3 層 MLP，輸出維度 d_canon=256/512。
+
+L_fd 的 λ：先用 5e-3（Barlow Twins 常見量級），之後 sweep 1e-3 ~ 1e-2。
+
+併入 L_fd 的頻率 n：先設 n=1（每步都算），如不穩再改 n=4。
+
+τ（L_fd 總縮放）：1.0 起步，視穩定度微調。
+
+最佳化：AdamW，lr=2e-4（線性 warmup → cosine decay），batch size 依顯存調；label smoothing 關閉（因為是擴散式訓練）。
+
+Regularization：Dropout 0.1；梯度裁剪 1.0。
+
+長度控制：訓練時為每個樣本取 t ~ Uniform[1, T]；文本長度上限（例如 300 字/詞）。
+
+程式層級的關鍵模組
+
+DiffusionScheduler：產生 M_t、M^t、β_t、以及前向取樣 q(x_t|x_0)；提供 posterior q(x_{t-1}|x_t, x̂_0) 的封裝。
+
+AcousticEncoder：包裝 WavLM-Large（凍結），輸出 c。
+
+DenoiseDecoder（Transformer）：輸入 x_t 嵌入 + t 嵌入 + cross-attend to c，輸出對 x̂_0 的 logits。
+
+ProjectionHeads：h_ϕa（給 c）、g_ω + h_ϕb（給 x̂_0）。
+
+Losses：計算 L_cvb（逐 t 的 KL）與 L_fd；聚合 L_total。
+
+Trainer：對照 Algorithm 1 的流程（抽 t、取樣 x_t、推前向、計損失、每 n 步併入 L_fd、更新 θ/ϕ_a/ϕ_b/ω）。
+
+Sampler：支援標準逐步與 jumpy sampling（Algorithm 2）、greedy 解碼。
+
+驗證、消融與日誌
+
+消融：關 L_fd 觀察 WER/CER 變化；不同 r（jumpy 步長）對延遲/WER 的取捨；不同 T（10/20/50/100）。
+
+記錄：訓練/驗證損失、L_fd 對角/非對角項均值、WER/CER、吞吐與推論延遲。
+
+可能的風險與排錯路線
+
+訓練不穩：先關 L_fd、只跑 L_cvb；或把 τ/λ 調小、n 增大（降低 L_fd 介入頻率）。
+
+生成崩壞（全同 token）：檢查 M_t 是否正確（均勻轉移），β_t 排程是否太大；確認 posterior 計算維度與 one-hot 邏輯。
+
+條件無效：確認解碼器 cross-attention 有吃到 c；嘗試在每層加 cross-attn 或加 gating。
+
+詞表不合：中文/台語請先跑小 K 的詞表確認流程正確，再放大詞表。
+
+預期里程碑
+
+里程碑 A：英語 LibriSpeech 小模型（~100M）能收斂並跑通推論（T=50，無 jump）。
+
+里程碑 B：加入 L_fd 並穩定訓練，完成消融。
+
+里程碑 C：導入 jumpy sampling（r=2/5），對齊論文趨勢：延遲大降而 WER 幾乎不變。
+
+里程碑 D：切換到 zh-TW / nan-tw，完成 tokenizer 與文本規則兩方案（A/B）比較，報 CER/WER。

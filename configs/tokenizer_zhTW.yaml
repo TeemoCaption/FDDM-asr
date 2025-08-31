@@ -1,0 +1,30 @@
+# configs/tokenizer_zhTW.yaml
+# 目的：為 zh-TW（A 案：已在前處理移除括號內羅馬字）訓練 SentencePiece tokenizer 的設定
+
+corpus:
+  # 讀取由 preprocess.py 產生的索引檔（請先跑完 preprocess.py）
+  index_csv: "data/processed/index.csv"   # 來源語料檔（欄位 normalized_sentence）
+  text_field: "normalized_sentence"       # 用來訓練 tokenizer 的欄位
+  min_len: 1                              # 句子最小長度（過短的句子會濾掉）
+  max_len: 300                            # 句子最大長度（對齊論文評估上限）
+
+tokenizer:
+  type: "sentencepiece"                   # 目前支援 sentencepiece
+  model_prefix: "spm_zhTW_A"              # 產出檔名前綴
+  vocab_size: 8000                        # 詞彙表大小（起步 8k，可再調整）
+  model_type: "bpe"                       # spm 的訓練模式：bpe | unigram | char
+  character_coverage: 0.9995              # 覆蓋度（中文建議 >= 0.9995）
+  input_sentence_size: 2000000            # 隨機子抽樣數（若語料太大時）
+  shuffle_input_sentence: true            # 訓練前打散
+  # 註：若要跑「中文字 + 羅馬字子詞（B 案）」可另外做一份 config
+  extra_user_symbols: []
+
+special_tokens:
+  pad: "<pad>"
+  bos: "<s>"
+  eos: "</s>"
+  unk: "<unk>"
+
+output:
+  dir: "data/tokenizer/zh-TW_A"           # 產物輸出資料夾
+  export_vocab_json: "vocab.json"         # 另存一份可讀性較高的 json
