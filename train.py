@@ -41,11 +41,12 @@ from torch import amp  # 提供 amp.GradScaler 與 amp.autocast（跨裝置統�
 from models.acoustic_encoder import AcousticEncoder
 from models.denoise_decoder import DenoisingTransformerDecoder
 from models.projection import SpeechProjector, TextEmbedding, TextProjector
+# 匯入評估函數
 from models.evaluate import (
-    calculate_cer, logits_to_text, evaluate_train_cer, evaluate_cer,
+    calculate_cer, logits_to_text, evaluate_train_cer,
     evaluate_validation_loss, evaluate_cer_with_full_sampling,
     evaluate_cer_with_jumpy_sampling, evaluate_cer_with_multi_sample
-)  # 匯入評估函數
+)
 from losses.fddm_losses import lfd_loss
 
 # 進度條（若沒安裝也能安全退回）
