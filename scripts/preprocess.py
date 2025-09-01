@@ -240,15 +240,15 @@ def process_language_batch(dataset_name: str,
         batch_records = []
         batch_start_idx = 0
         
-        # 分批處理 DataFrame
-        for batch_start_idx in range(0, len(df), batch_size):
+        # 分批處理 DataFrame，使用 tqdm 顯示批次處理進度
+        for batch_start_idx in tqdm(range(0, len(df), batch_size), desc=f"處理 {split} 批次"):
             batch_end_idx = min(batch_start_idx + batch_size, len(df))
             batch_df = df.iloc[batch_start_idx:batch_end_idx]
             
             print(f"處理批次 {batch_start_idx}-{batch_end_idx}（總共 {len(df)}）")
             
-            # 處理當前批次的每個檔案
-            for idx, row in batch_df.iterrows():
+            # 處理當前批次的每個檔案，使用 tqdm 顯示檔案處理進度
+            for idx, row in tqdm(batch_df.iterrows(), total=len(batch_df), desc="處理檔案"):
                 rel_path = row["path"]                            # 如 'common_voice_zh-TW_12345.mp3'
                 src_fp = os.path.join(clips_dir, rel_path)        # 絕對路徑
 
