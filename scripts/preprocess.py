@@ -164,12 +164,14 @@ def generate_index(splits_data):
         clips_dir = os.path.join(split_dir, "clips")
         processed_clips_dir = os.path.join(PROCESSED_DATA_DIR, "clips")
         os.makedirs(processed_clips_dir, exist_ok=True)  # 確保處理後音檔目錄存在
-        df['processed_path'] = df['path'].apply(lambda x: os.path.join(processed_clips_dir, f"{split_name}_{x}"))
+        # 修改：將 processed_path 設為完整相對路徑，相對於專案根目錄 ROOT_DIR，便於訓練時直接使用和資料遷移
+        df['processed_path'] = df['path'].apply(lambda x: os.path.join("data", "processed", "clips", f"{split_name}_{x}"))
 
         # 處理每個音檔
         for idx, row in df.iterrows():
             original_path = os.path.join(clips_dir, row['path'])
-            processed_path = row['processed_path']
+            # 修改：將完整相對路徑的 processed_path 轉換為絕對路徑進行實際檔案處理，確保寫入正確位置
+            processed_path = os.path.join(ROOT_DIR, row['processed_path'])
 
             if os.path.exists(original_path):
                 process_audio(original_path, processed_path)
