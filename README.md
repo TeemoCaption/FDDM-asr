@@ -185,7 +185,7 @@ Saved best model to: ckpts/fddm_zhTW_base/best_model.pt
 Epoch 1 Test CER: 0.4456
 
 ==================================================
-🏆 TRAINING COMPLETED!
+TRAINING COMPLETED!
 Best validation CER: 0.4234 (Epoch 1)
 Best model saved at: ckpts/fddm_zhTW_base/best_model.pt
 ==================================================
@@ -206,7 +206,7 @@ Best model saved at: ckpts/fddm_zhTW_base/best_model.pt
 - **精確模式 (exact)**: 嚴格遵循論文 Algorithm 2
 - **快速模式 (fast)**: 計算效率優化版本
 
-## ⚠️ 注意事項
+## 注意事項
 
 - **資料路徑**: 確保配置檔案中的資料路徑正確
 - **權重載入**: 推論時優先使用 `best_model.pt`

@@ -643,7 +643,7 @@ def main():
     
     # 訓練結束後報告最佳權重資訊
     print("\n" + "="*50)
-    print("🏆 TRAINING COMPLETED!")
+    print("TRAINING COMPLETED!")
     print(f"Best validation CER: {best_val_cer:.4f} (Epoch {best_epoch})")
     print(f"Best model saved at: {os.path.join(cfg.log['ckpt_dir'], 'best_model.pt')}")
     print("="*50)
