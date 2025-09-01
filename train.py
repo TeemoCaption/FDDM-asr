@@ -68,27 +68,71 @@ except Exception as e:
 
 # ============ 資料集骨架（請換成你的前處理） ============
 class CVZhTWDataset(Dataset):
-    """最小版 Dataset：
-    - 假設前處理後你有 JSONL 或其他檔，能取到 waveform 與 tokenized text（x0）
-    - 這裡用隨機資料示範，讓訓練骨架可直接跑通。
+    """從 JSON 索引載入真實資料的 Dataset：
+    - 從 data/processed/train.json 等載入樣本
+    - 載入對應的音頻檔案和文本
+    - 使用 tokenizer 將文本轉換為 token IDs
     """
-    def __init__(self, num_samples: int, T_wav: int, L_tok: int, vocab_size: int, pad_id: int):
+    def __init__(self, json_file: str, tokenizer_vocab_path: str, max_len: int, pad_id: int, bos_id: int = None, eos_id: int = None):
         super().__init__()
-        self.num = num_samples
-        self.T_wav = T_wav
-        self.L_tok = L_tok
-        self.vocab = vocab_size
-        self.pad = pad_id
+        import json
+        import sentencepiece as spm
+        import librosa
+        import soundfile as sf
+        
+        # 載入 JSON 資料
+        with open(json_file, 'r', encoding='utf-8') as f:
+            self.data = json.load(f)
+        
+        self.max_len = max_len
+        self.pad_id = pad_id
+        self.bos_id = bos_id
+        self.eos_id = eos_id
+        
+        # 載入 tokenizer
+        self.tokenizer = spm.SentencePieceProcessor()
+        self.tokenizer.load(tokenizer_vocab_path)
+        
+        # 過濾有效樣本（有音頻檔案的）
+        self.valid_indices = []
+        for i, item in enumerate(self.data):
+            processed_path = item.get('processed_path')
+            if processed_path and os.path.exists(processed_path):
+                self.valid_indices.append(i)
+        
+        print(f"載入 {len(self.valid_indices)} 個有效樣本從 {json_file}")
+    
     def __len__(self):
-        return self.num
+        return len(self.valid_indices)
+    
     def __getitem__(self, idx):
-        wav = torch.randn(self.T_wav)                # 模擬 waveform
-        import random as _random
-        L = _random.randint(self.L_tok//2, self.L_tok)
-        x0 = torch.randint(1, self.vocab, (L,))      # 1..V-1 隨機 token
-        if L < self.L_tok:
-            pad = torch.full((self.L_tok-L,), self.pad)
-            x0 = torch.cat([x0, pad], dim=0)
+        data_idx = self.valid_indices[idx]
+        item = self.data[data_idx]
+        
+        # 載入音頻
+        import librosa
+        import soundfile as sf
+        wav, sr = librosa.load(item['processed_path'], sr=16000)
+        wav = torch.tensor(wav, dtype=torch.float32)
+        
+        # 處理文本
+        text = item['normalized_sentence']
+        tokens = self.tokenizer.encode(text)
+        
+        # 添加特殊 token
+        if self.bos_id is not None:
+            tokens = [self.bos_id] + tokens
+        if self.eos_id is not None:
+            tokens = tokens + [self.eos_id]
+        
+        # 截斷或填充
+        if len(tokens) > self.max_len:
+            tokens = tokens[:self.max_len]
+        else:
+            tokens += [self.pad_id] * (self.max_len - len(tokens))
+        
+        x0 = torch.tensor(tokens, dtype=torch.long)
+        
         return wav, x0
 
 @dataclass
@@ -320,13 +364,18 @@ def main():
     params = list(decoder.parameters()) + list(s_proj.parameters()) + list(t_embed.parameters()) + list(t_proj.parameters())
     optim = torch.optim.AdamW(params, lr=cfg.optim['lr'], weight_decay=cfg.optim['weight_decay'])
 
-    # ==== DataLoader（先用隨機資料跑通） ====
-    sr = cfg.data['sample_rate']
-    max_sec = cfg.data['max_seconds']
-    T_wav = sr * max_sec
-    L_tok = 128
-
-    train_set = CVZhTWDataset(num_samples=200, T_wav=T_wav, L_tok=L_tok, vocab_size=vocab, pad_id=pad_id)
+    # ==== DataLoader（從 train.json 載入真實資料） ====
+    train_json = cfg.data.get('train_json', 'data/processed/train.json')
+    tokenizer_model_path = cfg.data.get('tokenizer_model_path', 'data/tokenizer/zh-TW_A/spm_zhTW_A.model')
+    
+    train_set = CVZhTWDataset(
+        json_file=train_json,
+        tokenizer_vocab_path=tokenizer_model_path,
+        max_len=cfg.data.get('max_len', 128),
+        pad_id=pad_id,
+        bos_id=cfg.data.get('bos_id'),
+        eos_id=cfg.data.get('eos_id')
+    )
     train_loader = DataLoader(train_set, batch_size=cfg.optim['batch_size'], shuffle=True, drop_last=True)
 
     # ==== 訓練 ====

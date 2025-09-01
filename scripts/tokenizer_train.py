@@ -33,38 +33,46 @@ def load_config(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
-def prepare_corpus_text(index_csv: str,
-                        text_field: str,
-                        min_len: int,
-                        max_len: int) -> list:
+def prepare_corpus_text_from_json(index_json_files: list,
+                                   text_field: str,
+                                   min_len: int,
+                                   max_len: int) -> list:
     """
-    從 index.csv 讀出語料文字，並做長度篩選。
+    從多個 JSON 索引檔案讀出語料文字，並做長度篩選。
     參數：
-        index_csv:  preprocess 產生的 CSV 路徑
-        text_field: 欲用來訓練 tokenizer 的欄位（此專案為 normalized_sentence）
-        min_len:    最短長度
-        max_len:    最長長度
+        index_json_files: list[str]，JSON 檔案路徑列表（如 ["data/processed/train.json", ...]）
+        text_field: str，用來訓練 tokenizer 的欄位（此專案為 normalized_sentence）
+        min_len: int，最短長度
+        max_len: int，最長長度（可為 None）
     回傳：
         List[str]：每個元素是一個句子
     """
-    if not os.path.exists(index_csv):
-        raise FileNotFoundError(f"找不到語料 CSV：{index_csv}\n請先執行 preprocess.py 產生 data/processed/index.csv")
-
-    df = pd.read_csv(index_csv)
-    if text_field not in df.columns:
-        raise KeyError(f"CSV 中找不到欄位 `{text_field}`。可檢查 preprocess.py 的輸出欄位。")
-
     texts = []
-    for s in df[text_field].astype(str).tolist():
-        s = s.strip()
-        if min_len is not None and len(s) < min_len:
-            continue
-        if max_len is not None and len(s) > max_len:
-            s = s[:max_len]
-        if s:
-            texts.append(s)
+    
+    for json_file in index_json_files:
+        if not os.path.exists(json_file):
+            raise FileNotFoundError(f"找不到語料 JSON：{json_file}\n請先執行 preprocess.py 產生對應檔案")
+        
+        with open(json_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        # 假設 data 是 list of dict
+        for item in data:
+            if text_field not in item:
+                raise KeyError(f"JSON 中找不到欄位 `{text_field}`。可檢查 preprocess.py 的輸出欄位。")
+            
+            s = str(item[text_field]).strip()
+            if min_len is not None and len(s) < min_len:
+                continue
+            if max_len is not None and len(s) > max_len:
+                s = s[:max_len]
+            if s:
+                texts.append(s)
+    
     if len(texts) == 0:
-        raise ValueError("語料為空，請檢查 index_csv / text_field / 長度門檻。")
+        raise ValueError("語料為空，請檢查 index_json_files / text_field / 長度門檻。")
+    
+    print(f"總共載入 {len(texts)} 個句子從 {len(index_json_files)} 個檔案")
     return texts
 
 def write_corpus_to_tempfile(texts: list) -> str:
@@ -159,8 +167,8 @@ def main():
     cfg = load_config(args.config)
 
     # 讀取語料
-    texts = prepare_corpus_text(
-        index_csv=cfg["corpus"]["index_csv"],
+    texts = prepare_corpus_text_from_json(
+        index_json_files=cfg["corpus"]["index_json_files"],
         text_field=cfg["corpus"]["text_field"],
         min_len=cfg["corpus"].get("min_len", 1),
         max_len=cfg["corpus"].get("max_len", None)
