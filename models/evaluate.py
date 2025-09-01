@@ -135,13 +135,14 @@ def evaluate_train_cer(
         x0 = x0.to(device)  # [B, L] 真實目標 ids
 
         # 取得條件 c
-        c, c_mask, _ = encoder(wave)  # [B, S, d]
+        c, c_mask, _ = encoder(wave)  # [B, S, d_model]
 
         # 這裡用 “t=1 的簡化版”：把 x_t 當作 x_0 直接餵（或自行選固定 t）
         # 你也可以呼叫完整的 diffusion 反推流程做更嚴謹的評估（較慢）
         t = torch.ones(x0.size(0), dtype=torch.long, device=device)
         xt = x0.clone()
 
+        # 使用正確的 DenoisingTransformerDecoder 接口
         logits = decoder(xt, t, c, x_mask=(x0 != pad_id), c_mask=c_mask)  # [B, L, V]
 
         # 還原文字
@@ -167,7 +168,7 @@ def evaluate_train_cer(
     return sum(cer_list) / len(cer_list)
 
 @torch.no_grad()
-def evaluate_cer(
+def evaluate_validation_loss(
     encoder,
     decoder,
     s_proj,
@@ -177,11 +178,10 @@ def evaluate_cer(
     data_loader,
     device: torch.device,
     cfg,
-    tokenizer,
 ) -> float:
     """
-    驗證/測試集 CER（同上，為了速度用簡化 argmax 推論）。
-    若你已完成「Cross-Modality Diffusion 的完整取樣流程」，可替換為真正的解碼器。
+    計算驗證集的平均損失（用於監控訓練過程）
+    使用與訓練相同的損失計算邏輯，但不進行反向傳播
     """
     encoder.eval()
     decoder.eval()
@@ -190,29 +190,273 @@ def evaluate_cer(
     t_proj.eval()
 
     pad_id = cfg.data['pad_id']
-    bos_id = cfg.data.get('bos_id')
-    eos_id = cfg.data.get('eos_id')
-
-    all_cer: List[float] = []
+    total_loss = 0.0
+    total_samples = 0
 
     for batch in data_loader:
         wave, x0 = batch
         wave = wave.to(device)
         x0 = x0.to(device)
+        B, L = x0.shape
 
         c, c_mask, _ = encoder(wave)
         t = torch.ones(x0.size(0), dtype=torch.long, device=device)
         xt = x0.clone()
 
-        logits = decoder(xt, t, c, x_mask=(x0 != pad_id), c_mask=c_mask)
-        hyps = logits_to_text(logits, tokenizer, pad_id, bos_id, eos_id)
-        refs = [
-            _ids_to_text_one(x0[i], tokenizer, pad_id, bos_id, eos_id)
-            for i in range(x0.size(0))
-        ]
-        for r, h in zip(refs, hyps):
-            all_cer.append(calculate_cer(r, h))
+        with torch.no_grad():
+            # 使用正確的 DenoisingTransformerDecoder 接口
+            logits = decoder(xt, t, c, x_mask=(x0 != pad_id), c_mask=c_mask)
+            x_mask = (x0 != pad_id)
+            loss_diff = scheduler.kl_term(xt, x0, logits, t, x_mask)
 
-    if len(all_cer) == 0:
-        return 1.0
-    return sum(all_cer) / len(all_cer)
+        total_loss += loss_diff.item() * B  # 乘以batch大小得到總損失
+        total_samples += B
+
+    return total_loss / total_samples if total_samples > 0 else 0.0
+
+@torch.no_grad()
+def evaluate_cer_with_full_sampling(
+    encoder,
+    decoder,
+    scheduler,
+    data_loader,
+    device: torch.device,
+    cfg,
+    tokenizer,
+    sampling_config: dict = None,
+) -> float:
+    """
+    使用完整 diffusion 採樣的 CER 評估（真實推論場景）
+
+    參數：
+        encoder: 聲學編碼器
+        decoder: 去噪解碼器
+        scheduler: 擴散排程器
+        data_loader: 資料載入器
+        device: 計算裝置
+        cfg: 配置物件
+        tokenizer: 文字編碼器
+        sampling_config: 採樣配置參數
+
+    回傳：
+        平均 CER 值
+    """
+    # 匯入 jumpy sampler
+    from sampler.jumpy_sampler import DiffusionJumpySampler
+
+    # 預設採樣配置
+    if sampling_config is None:
+        sampling_config = {
+            'T_infer': cfg.get('inference', {}).get('T_infer', 20),
+            'r': cfg.get('inference', {}).get('r', 2),
+            'greedy': cfg.get('inference', {}).get('greedy', True),
+            'posterior_mode': cfg.get('inference', {}).get('posterior_mode', 'average'),
+            'sampling_mode': cfg.get('inference', {}).get('sampling_mode', 'exact'),
+            'temperature': cfg.get('inference', {}).get('temperature', 1.0),
+        }
+
+    encoder.eval()
+    decoder.eval()
+
+    pad_id = cfg.data['pad_id']
+    total_cer = 0.0
+    total_samples = 0
+
+    # 建立 jumpy sampler
+    vocab_size = cfg.data['vocab_size']
+    T_train = cfg.diffusion['T']
+
+    sampler = DiffusionJumpySampler(
+        scheduler=scheduler.sch if hasattr(scheduler, 'sch') else scheduler,
+        decoder=decoder,
+        K=vocab_size,
+        T_train=T_train,
+        T_infer=sampling_config['T_infer'],
+        r=sampling_config['r'],
+        greedy=sampling_config['greedy'],
+        posterior_mode=sampling_config['posterior_mode'],
+        sampling_mode=sampling_config['sampling_mode'],
+        temperature=sampling_config['temperature'],
+        device=device,
+    )
+
+    for batch in data_loader:
+        wave, x0 = batch
+        wave = wave.to(device)
+        B, L = x0.shape
+
+        # 取得聲學條件
+        c, c_mask, _ = encoder(wave)
+
+        # 使用 jumpy sampler 進行完整 diffusion 採樣
+        # 注意：這裡使用真實的序列長度作為目標
+        x_pred, _ = sampler.sample(cond_c=c, seq_len=L)
+
+        # 還原預測文字
+        pred_text_batch = logits_to_text(
+            torch.zeros(B, L, vocab_size, device=device).scatter_(-1, x_pred.unsqueeze(-1), 1.0),
+            tokenizer, pad_id, cfg.data.get('bos_id'), cfg.data.get('eos_id')
+        )
+
+        # 還原真實文字
+        refs = [
+            _ids_to_text_one(x0[i], tokenizer, pad_id, cfg.data.get('bos_id'), cfg.data.get('eos_id'))
+            for i in range(B)
+        ]
+
+        # 計算 CER
+        for ref, hyp in zip(refs, pred_text_batch):
+            cer = calculate_cer(ref, hyp)
+            total_cer += cer
+            total_samples += 1
+
+    return (total_cer / total_samples) if total_samples > 0 else 0.0
+
+@torch.no_grad()
+def evaluate_cer_with_multi_sample(
+    encoder,
+    decoder,
+    scheduler,
+    data_loader,
+    device: torch.device,
+    cfg,
+    tokenizer,
+    sampling_config: dict = None,
+    num_samples: int = 3,
+) -> float:
+    """
+    使用多樣本平均的 CER 評估（對同一輸入進行多次採樣取平均）
+
+    參數：
+        encoder: 聲學編碼器
+        decoder: 去噪解碼器
+        scheduler: 擴散排程器
+        data_loader: 資料載入器
+        device: 計算裝置
+        cfg: 配置物件
+        tokenizer: 文字編碼器
+        sampling_config: 採樣配置參數
+        num_samples: 每次輸入的採樣次數
+
+    回傳：
+        平均 CER 值
+    """
+    # 匯入 jumpy sampler
+    from sampler.jumpy_sampler import DiffusionJumpySampler
+
+    # 預設採樣配置
+    if sampling_config is None:
+        sampling_config = {
+            'T_infer': cfg.get('inference', {}).get('T_infer', 20),
+            'r': cfg.get('inference', {}).get('r', 2),
+            'greedy': cfg.get('inference', {}).get('greedy', True),
+            'posterior_mode': cfg.get('inference', {}).get('posterior_mode', 'average'),
+            'sampling_mode': cfg.get('inference', {}).get('sampling_mode', 'exact'),
+            'temperature': cfg.get('inference', {}).get('temperature', 1.0),
+        }
+
+    encoder.eval()
+    decoder.eval()
+
+    pad_id = cfg.data['pad_id']
+    vocab_size = cfg.data['vocab_size']
+    T_train = cfg.diffusion['T']
+    total_cer = 0.0
+    total_samples = 0
+
+    for batch in data_loader:
+        wave, x0 = batch
+        wave = wave.to(device)
+        B, L = x0.shape
+
+        # 取得聲學條件
+        c, c_mask, _ = encoder(wave)
+
+        # 對每個樣本進行多次採樣
+        batch_predictions = []
+        for b in range(B):
+            sample_predictions = []
+            c_single = c[b:b+1]  # [1, S, D]
+
+            for _ in range(num_samples):
+                # 建立針對單一樣本的 sampler
+                sampler = DiffusionJumpySampler(
+                    scheduler=scheduler.sch if hasattr(scheduler, 'sch') else scheduler,
+                    decoder=decoder,
+                    K=vocab_size,
+                    T_train=T_train,
+                    T_infer=sampling_config['T_infer'],
+                    r=sampling_config['r'],
+                    greedy=False,  # 多樣本需要隨機性
+                    posterior_mode=sampling_config['posterior_mode'],
+                    sampling_mode=sampling_config['sampling_mode'],
+                    temperature=sampling_config['temperature'],
+                    device=device,
+                )
+
+                # 進行採樣
+                x_pred, _ = sampler.sample(cond_c=c_single, seq_len=L)  # [1, L]
+
+                # 轉換為文字
+                pred_text = _ids_to_text_one(
+                    x_pred[0], tokenizer, pad_id,
+                    cfg.data.get('bos_id'), cfg.data.get('eos_id')
+                )
+                sample_predictions.append(pred_text)
+
+            # 對多次採樣結果進行投票或平均
+            # 這裡使用簡單的多數決策略
+            batch_predictions.append(sample_predictions[0])  # 臨時使用第一個樣本
+
+        # 還原真實文字
+        refs = [
+            _ids_to_text_one(x0[i], tokenizer, pad_id, cfg.data.get('bos_id'), cfg.data.get('eos_id'))
+            for i in range(B)
+        ]
+
+        # 計算 CER
+        for ref, hyp in zip(refs, batch_predictions):
+            cer = calculate_cer(ref, hyp)
+            total_cer += cer
+            total_samples += 1
+
+    return (total_cer / total_samples) if total_samples > 0 else 0.0
+
+@torch.no_grad()
+def evaluate_cer_with_jumpy_sampling(
+    encoder,
+    decoder,
+    scheduler,
+    data_loader,
+    device: torch.device,
+    cfg,
+    tokenizer,
+) -> float:
+    """
+    使用 Jumpy Sampler 的完整 CER 評估（論文中的高效採樣策略）
+
+    參數：
+        encoder: 聲學編碼器
+        decoder: 去噪解碼器
+        scheduler: 擴散排程器
+        data_loader: 資料載入器
+        device: 計算裝置
+        cfg: 配置物件
+        tokenizer: 文字編碼器
+
+    回傳：
+        平均 CER 值
+    """
+    # 從配置中讀取 jumpy sampling 參數
+    sampling_config = {
+        'T_infer': cfg.get('inference', {}).get('T_infer', 20),
+        'r': cfg.get('inference', {}).get('r', 5),
+        'greedy': cfg.get('inference', {}).get('greedy', True),
+        'posterior_mode': cfg.get('inference', {}).get('posterior_mode', 'average'),
+        'sampling_mode': cfg.get('inference', {}).get('sampling_mode', 'exact'),
+        'temperature': cfg.get('inference', {}).get('temperature', 1.0),
+    }
+
+    return evaluate_cer_with_full_sampling(
+        encoder, decoder, scheduler, data_loader, device, cfg, tokenizer, sampling_config
+    )

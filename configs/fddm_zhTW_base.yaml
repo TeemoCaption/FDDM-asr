@@ -49,12 +49,13 @@ inference:
   
   # 跳步採樣參數
   jumpy_sampling:
+    T_infer: 20      # 推論步數可小於訓練的 200
     r: 2                    # 每次跳躍的步數（Δ），可選 2, 5, 10 等
     greedy: true            # true: argmax 採樣；false: categorical 採樣
     temperature: 1.0        # 採樣溫度（僅在 greedy=false 時生效）
     
     # 後驗模式："average" 或 "max"
-    posterior_mode: "average"
+    posterior_mode: "map"
     
     # 採樣模式："exact" 或 "fast"
     # - "exact": 使用論文 Algorithm 2 的嚴格多步後驗 q(x_{t-Δ}|x_t,x̂0)

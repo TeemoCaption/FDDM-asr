@@ -41,7 +41,11 @@ from torch import amp  # 提供 amp.GradScaler 與 amp.autocast（跨裝置統�
 from models.acoustic_encoder import AcousticEncoder
 from models.denoise_decoder import DenoisingTransformerDecoder
 from models.projection import SpeechProjector, TextEmbedding, TextProjector
-from models.evaluate import calculate_cer, logits_to_text, evaluate_train_cer, evaluate_cer  # 匯入評估函數
+from models.evaluate import (
+    calculate_cer, logits_to_text, evaluate_train_cer, evaluate_cer,
+    evaluate_validation_loss, evaluate_cer_with_full_sampling,
+    evaluate_cer_with_jumpy_sampling, evaluate_cer_with_multi_sample
+)  # 匯入評估函數
 from losses.fddm_losses import lfd_loss
 
 # ====== 重要提醒：Tokenizer 特殊 Token 對應 ======
@@ -285,7 +289,7 @@ def train_one_epoch(
     cfg: Config,
     global_step: int,
     scaler: GradScaler = None,  # 添加 AMP scaler 參數
-) -> int:
+) -> tuple[int, float]:  # 返回 global_step 和平均訓練損失
     encoder.eval()   # 預設凍結
     decoder.train()
     s_proj.train()
@@ -295,6 +299,10 @@ def train_one_epoch(
     pad_id = cfg.data['pad_id']
     T_total = cfg.diffusion['T']
     log_every = cfg.log['log_every']
+
+    # 初始化訓練損失累積器
+    epoch_loss_sum = 0.0
+    epoch_step_count = 0
 
     for batch_idx, (wave, x0) in enumerate(loader, start=1):
         wave = wave.to(device)
@@ -402,8 +410,16 @@ def train_one_epoch(
                 log_msg += f" loss_fd={loss_fd_value:.4f} w_t={float(w_t):.4f}"  # w_t 通常不需要梯度
             log_msg += f" total_loss={total_loss_value:.4f}"
             print(log_msg)
+        
+        # 累積訓練損失
+        epoch_loss_sum += total_loss_value
+        epoch_step_count += 1
+        
         global_step += 1
-    return global_step
+    
+    # 計算平均訓練損失
+    avg_train_loss = epoch_loss_sum / epoch_step_count if epoch_step_count > 0 else 0.0
+    return global_step, avg_train_loss
 
 # ============ 訓練 CER 計算函數 ============
 # CER 評估相關函數已移至 models/evaluate.py
@@ -527,7 +543,7 @@ def main():
     
     for epoch in range(1, cfg.optim['num_epochs']+1):
         print(f"Epoch {epoch}")
-        global_step = train_one_epoch(
+        global_step, train_loss = train_one_epoch(
             encoder, decoder, s_proj, t_embed, t_proj,
             scheduler, train_loader, optim, device, cfg, global_step,
             scaler  # 傳入 AMP GradScaler
@@ -538,7 +554,7 @@ def main():
             encoder, decoder, s_proj, t_embed, t_proj,
             scheduler, train_loader, device, cfg, tokenizer, max_batches=5
         )
-        print(f"Epoch {epoch} Train CER: {train_cer:.4f}")
+        print(f"Epoch {epoch} Train CER: {train_cer:.4f} | Train Loss: {train_loss:.4f}")
         
         # 每個 epoch 結束後進行驗證
         if val_loader is not None:
@@ -546,7 +562,12 @@ def main():
                 encoder, decoder, s_proj, t_embed, t_proj,
                 scheduler, val_loader, device, cfg, tokenizer
             )
-            print(f"Epoch {epoch} Validation CER: {val_cer:.4f}")
+            # 計算驗證損失
+            val_loss = evaluate_validation_loss(
+                encoder, decoder, s_proj, t_embed, t_proj,
+                scheduler, val_loader, device, cfg
+            )
+            print(f"Epoch {epoch} Validation CER: {val_cer:.4f} | Validation Loss: {val_loss:.4f}")
             
             # 檢查是否為最佳驗證 CER
             if val_cer < best_val_cer:
