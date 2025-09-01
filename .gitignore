@@ -1,0 +1,126 @@
+# Python 相關檔案
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pyenv
+.python-version
+
+# celery beat schedule file
+celerybeat-schedule
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE 相關
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 作業系統相關
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# 模型和檢查點
+*.pth
+*.pt
+*.ckpt
+*.pkl
+*.model
+checkpoints/
+logs/
+wandb/
+tensorboard_logs/
+
+# Data 資料夾設定
+# 忽略整個 data 資料夾的所有內容
+data/
+
+# 但保留 data/raw 資料夾結構（空資料夾）
+!data/
+!data/raw/
+# 忽略 raw 資料夾內的所有內容
+data/raw/*
+
+# 可選：如果您想在 raw 資料夾內保留一個說明檔案
+!data/raw/.gitkeep
+!data/raw/README.md
+
+# 臨時檔案
+*.tmp
+*.temp
+*.log
+*.out
+*.err
+
+# 音訊檔案（通常很大）
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.m4a
+*.aac
+
+# 壓縮檔案
+*.zip
+*.tar.gz
+*.tar.bz2
+*.rar
+*.7z

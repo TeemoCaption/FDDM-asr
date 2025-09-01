@@ -107,9 +107,8 @@ class CVZhTWDataset(Dataset):
         self.tokenizer = spm.SentencePieceProcessor()
         self.tokenizer.load(tokenizer_vocab_path)
         
-        # 計算最大音頻長度（從配置中讀取，或使用預設值）
-        # max_seconds 通常在配置中設定，預設為 20 秒
-        self.max_audio_samples = 20 * 16000  # 預設 20 秒 * 16kHz
+        # 設定最大音頻長度（預設 20 秒 * 16kHz）
+        self.max_audio_samples = 20 * 16000
         
         # 過濾有效樣本（有音頻檔案的）
         self.valid_indices = []
@@ -133,16 +132,14 @@ class CVZhTWDataset(Dataset):
         wav, sr = librosa.load(item['processed_path'], sr=16000)
         wav = torch.tensor(wav, dtype=torch.float32)
         
-        # 確保音頻長度一致：截斷或填充到固定長度
+        # 對齊音頻長度（截斷或零填充）
         if len(wav) > self.max_audio_samples:
-            # 截斷過長的音頻
             wav = wav[:self.max_audio_samples]
         elif len(wav) < self.max_audio_samples:
-            # 填充過短的音頻（用零填充）
             padding = torch.zeros(self.max_audio_samples - len(wav))
             wav = torch.cat([wav, padding], dim=0)
         
-        # 處理文本
+        # 文本 → token ids
         text = item['normalized_sentence']
         tokens = self.tokenizer.encode(text)
         
@@ -152,18 +149,16 @@ class CVZhTWDataset(Dataset):
         if self.eos_id is not None:
             tokens = tokens + [self.eos_id]
         
-        # 截斷或填充
+        # 截斷或填充到 max_len
         if len(tokens) > self.max_len:
             tokens = tokens[:self.max_len]
         else:
             tokens += [self.pad_id] * (self.max_len - len(tokens))
         
         x0 = torch.tensor(tokens, dtype=torch.long)
-        
         return wav, x0
         
-# ============ CER 評估指標實作 ============
-# CER 評估相關函數已移至 models/evaluate.py
+# ============ CER 評估指標實作已移至 models/evaluate.py ============
 @dataclass
 class Config:
     seed: int
@@ -179,101 +174,93 @@ class Config:
 class SchedulerAdapter:
     def __init__(self, scheduler):
         self.sch = scheduler
+
     def sample_q(self, x0: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        # 轉換 x0 為 one-hot 格式並呼叫 scheduler 的 q_sample 方法
+        """前向擴散：x0 → xt（依 multinomial diffusion）"""
         B, L = x0.shape
         vocab_size = self.sch.K
         x0_onehot = torch.zeros(B, L, vocab_size, device=x0.device)
-        x0_onehot.scatter_(-1, x0.unsqueeze(-1), 1.0)  # 轉為 one-hot
-        xt_prob = self.sch.q_sample(x0_onehot, t)  # 呼叫實際的方法名稱
+        x0_onehot.scatter_(-1, x0.unsqueeze(-1), 1.0)  # one-hot
+        xt_prob = self.sch.q_sample(x0_onehot, t)      # 機率分佈
         # 從機率分佈採樣回離散 token
         return torch.multinomial(xt_prob.view(-1, vocab_size), 1).view(B, L)
+
     def kl_term(self, xt: torch.Tensor, x0: torch.Tensor, logits_x0: torch.Tensor, t: torch.Tensor, x_mask: torch.Tensor = None) -> torch.Tensor:
         """
         可微分版本的 KL[q(xt-1|xt,x0) || p_theta(xt-1|xt,c)]。
-        參數：
-            xt:         [B, L]，第 t 步的離散樣本（整數 id）
-            x0:         [B, L]，真實目標（整數 id）
-            logits_x0:  [B, L, V]，模型對 x_0 的類別 logits（可微）
-            t:          [B]，每個樣本對應的時間步（1..T）
-            x_mask:     [B, L]，True 表有效 token（避免 pad 影響）
-        回傳：
-            樣本/序列聚合後的 scalar（需梯度）
+        - 以模型 Softmax(logits_x0) 近似 x̂0 的分佈，構造 posterior。
+        - 支援 x_mask，避免將 <pad> 納入 KL 計算。
         """
         B, L, V = logits_x0.shape
         device = logits_x0.device
-        dtype = logits_x0.dtype  # 用 float32/float16 皆可
+        dtype = logits_x0.dtype
 
-        # 將 logits 轉機率（保留梯度）
-        x0_hat = torch.softmax(logits_x0, dim=-1)                 # [B, L, V], requires_grad=True
+        # 模型預測的 x̂0 機率
+        x0_hat = torch.softmax(logits_x0, dim=-1)  # [B, L, V], requires_grad=True
 
-        # one-hot（不需要梯度，但不會阻斷 x0_hat 的梯度）
+        # one-hot 的 xt / x0（不需梯度）
         xt_onehot = torch.zeros(B, L, V, device=device, dtype=dtype)
-        xt_onehot.scatter_(-1, xt.unsqueeze(-1), 1.0)             # [B, L, V]
+        xt_onehot.scatter_(-1, xt.unsqueeze(-1), 1.0)
         x0_onehot = torch.zeros(B, L, V, device=device, dtype=dtype)
-        x0_onehot.scatter_(-1, x0.unsqueeze(-1), 1.0)             # [B, L, V]
+        x0_onehot.scatter_(-1, x0.unsqueeze(-1), 1.0)
 
-        # 取 betas_t 與 betas_{t-1}（t=1 時視作 beta_{0}=0 ⇒ M_0 為單位轉移）
+        # 取 betas_t 與 betas_{t-1}
         if not hasattr(self.sch, 'betas'):
             raise ValueError("Scheduler 需提供 self.betas (shape [T]) 才能計算 posterior。")
-        betas = self.sch.betas.to(device)                         # [T]
+        betas = self.sch.betas.to(device)  # [T]
 
-        beta_t_vec = betas[t - 1]                                 # [B]
-        prev_idx = (t - 2).clamp(min=0)                           # [B]；t=1 時先指向 0
-        beta_prev_vec = betas[prev_idx]                           # [B]
-        beta_prev_vec = torch.where(t.eq(1),                      # t=1 強制設為 0
-                                    torch.zeros_like(beta_prev_vec),
-                                    beta_prev_vec)
+        beta_t_vec = betas[t - 1]                           # [B]
+        prev_idx = (t - 2).clamp(min=0)
+        beta_prev_vec = betas[prev_idx]
+        beta_prev_vec = torch.where(t.eq(1), torch.zeros_like(beta_prev_vec), beta_prev_vec)
 
-        # 方便 broadcast 用的 shape
-        beta_t     = beta_t_vec.view(B, 1, 1)                     # [B,1,1]
-        beta_prev  = beta_prev_vec.view(B, 1, 1)                  # [B,1,1]
-        one        = torch.ones_like(x0_hat)                      # [B, L, V]
-        eps        = 1e-8
-        K          = float(V)
+        # 方便 broadcast
+        beta_t    = beta_t_vec.view(B, 1, 1)
+        beta_prev = beta_prev_vec.view(B, 1, 1)
+        one       = torch.ones_like(x0_hat)
+        eps       = 1e-8
+        K         = float(V)
 
         # M_t^T x_t = (β_t/K)*1 + (1-β_t)*x_t
-        MtT_xt = (beta_t / K) * one + (1.0 - beta_t) * xt_onehot  # [B, L, V]
+        MtT_xt = (beta_t / K) * one + (1.0 - beta_t) * xt_onehot
 
-        # M_{t-1} x ；"真實"用 x0 的 one-hot，"模型"用 x0_hat 的機率
-        Mprev_x0    = (1.0 - beta_prev) * x0_onehot + (beta_prev / K) * one   # [B, L, V]
-        Mprev_x0hat = (1.0 - beta_prev) * x0_hat    + (beta_prev / K) * one   # [B, L, V] requires_grad
+        # M_{t-1} x
+        Mprev_x0    = (1.0 - beta_prev) * x0_onehot + (beta_prev / K) * one
+        Mprev_x0hat = (1.0 - beta_prev) * x0_hat    + (beta_prev / K) * one  # requires_grad
 
         # 分母 x_t^T M_t x
-        # 真實：x = x0（one-hot）；模型：x = x0_hat（softmax 機率）
-        # gather：取出 x 在 xt 所指類別的值，shape [B,L]
-        x0_at_xt    = torch.sum(x0_onehot * xt_onehot, dim=-1)                      # [B, L], {0,1}
+        x0_at_xt    = torch.sum(x0_onehot * xt_onehot, dim=-1)  # [B, L], {0,1}
         x0hat_at_xt = torch.gather(x0_hat, dim=-1, index=xt.unsqueeze(-1)).squeeze(-1)  # [B, L]
 
-        beta_t_scalar = beta_t_vec.unsqueeze(-1)                                     # [B, 1]
-        denom_true = (beta_t_scalar / K) + (1.0 - beta_t_scalar) * x0_at_xt          # [B, L]
-        denom_pred = (beta_t_scalar / K) + (1.0 - beta_t_scalar) * x0hat_at_xt       # [B, L]
+        beta_t_scalar = beta_t_vec.unsqueeze(-1)  # [B, 1]
+        denom_true = (beta_t_scalar / K) + (1.0 - beta_t_scalar) * x0_at_xt
+        denom_pred = (beta_t_scalar / K) + (1.0 - beta_t_scalar) * x0hat_at_xt
 
-        # posterior：按元素相乘後除以分母（對每個 token 正規化）
-        q_post = (MtT_xt * Mprev_x0)    / (denom_true.unsqueeze(-1) + eps)           # [B, L, V]
-        p_post = (MtT_xt * Mprev_x0hat) / (denom_pred.unsqueeze(-1) + eps)           # [B, L, V], requires_grad
+        # posterior（真實 / 模型）
+        q_post = (MtT_xt * Mprev_x0)    / (denom_true.unsqueeze(-1) + eps)
+        p_post = (MtT_xt * Mprev_x0hat) / (denom_pred.unsqueeze(-1) + eps)  # requires_grad
 
         # KL per token：sum_k q * log(q/p)
         kl_token = torch.sum(q_post * (torch.log(q_post + eps) - torch.log(p_post + eps)), dim=-1)  # [B, L]
 
-        # 掩碼有效 token 再做平均
+        # 掩碼有效 token
         if x_mask is not None:
-            valid = x_mask.float()                                                   # [B, L]
-            kl_per_sample = (kl_token * valid).sum(dim=1) / (valid.sum(dim=1) + eps) # [B]
+            valid = x_mask.float()
+            kl_per_sample = (kl_token * valid).sum(dim=1) / (valid.sum(dim=1) + eps)
         else:
             kl_per_sample = kl_token.mean(dim=1)
 
         return kl_per_sample.mean()
+
     def w_t(self, t: torch.Tensor) -> torch.Tensor:
-        # 使用 scheduler 的 alpha_bar (即 w_prefix) 屬性
+        """w_t = ∏_{s=1}^t (1-β_s)，若無現成屬性則由 betas 現算。"""
         if hasattr(self.sch, 'alpha_bar'):
             alpha_bar = self.sch.alpha_bar.to(t.device)  # [T]
-            return alpha_bar[t-1]  # t 是 1-indexed
+            return alpha_bar[t-1]
         elif hasattr(self.sch, 'w_prefix'):
             w_prefix = self.sch.w_prefix.to(t.device)  # [T]
-            return w_prefix[t-1]  # t 是 1-indexed
+            return w_prefix[t-1]
         else:
-            # 備用方案：從 betas 計算
             if hasattr(self.sch, 'betas'):
                 betas = self.sch.betas.to(t.device)  # [T]
                 out = torch.ones_like(t, dtype=betas.dtype)
@@ -320,24 +307,9 @@ def train_one_epoch(
     """
     單一 epoch 的訓練流程，含進度條與即時統計；回傳 (global_step, avg_train_loss)。
 
-    參數說明：
-      encoder         聲學編碼器（通常凍結，只前向抽取條件 c）
-      decoder         擴散模型去噪解碼器，輸出對 x_0 的 logits
-      s_proj          語音側投影頭（L_fd 用到）
-      t_embed         文本側嵌入頭（吃 logits 或 token，用於 L_fd）
-      t_proj          文本側投影頭（L_fd 用到）
-      scheduler       Diffusion 時間排程與 KL 計算介面（Adapter）
-      loader          訓練 DataLoader
-      optimizer       參數最佳化器
-      device          torch.device
-      cfg             超參數設定（需含 data/diffusion/lfd/log/optim 等欄位）
-      global_step     目前全域步數（會累加）
-      scaler          AMP 的 GradScaler（None 代表使用 FP32）
-      epoch           當前 epoch（只用來顯示）
-      print_epoch_summary
-                       True 時，在函式結尾額外印出「本 epoch 平均訓練 loss」
-    回傳：
-      (global_step, avg_train_loss)
+    進度條顯示（精簡版）：
+      step, loss（總損失）, diff（KL 主損失）,
+      lfd（若該步有併入 L_fd 時才顯示）
     """
 
     # 模式設定：通常 encoder.eval()，其餘訓練
@@ -359,8 +331,8 @@ def train_one_epoch(
     pbar = _iter_with_progress(loader, desc=f"Epoch {epoch} [train]")
 
     # 用於計算「epoch 平均訓練 loss」
-    epoch_loss_sum = 0.0    # 累積本 epoch 的 total loss（含 L_fd）
-    epoch_step_cnt = 0      # 本 epoch 的梯度更新步數
+    epoch_loss_sum = 0.0
+    epoch_step_cnt = 0
 
     # 逐 batch 訓練
     for batch_idx, batch in enumerate(pbar, 1):
@@ -392,13 +364,12 @@ def train_one_epoch(
         x_mask = (x0 != pad_id)
 
         # 主要損失：Diffusion KL（論文 Eq.(6)）
-        # 注意：你的 Adapter 版本已支援 x_mask 以避免把 <pad> 納入 KL（與訓練目標一致）
         loss_diff = scheduler.kl_term(xt, x0, logits, t, x_mask)  # scalar
 
         # 是否在此步套用跨模態對齊損失 L_fd（論文 §3.3；總損失如式 (13)）
         apply_lfd = (global_step % n_step_fd) == 0
         loss = loss_diff
-        loss_fd_value = 0.0  # 僅用於日誌顯示
+        loss_fd_value = None  # 僅用於日誌顯示
         if apply_lfd:
             # 將對 x_0 的 logits 投影到文本特徵空間；語音條件亦投影到語音特徵空間
             with amp.autocast('cuda'):
@@ -416,19 +387,17 @@ def train_one_epoch(
             # w_t = ∏_{s=1}^t (1-β_s)（式 (13) 的權重；這裡取 batch mean 當 scalar）
             w_t = scheduler.w_t(t).mean()
 
-            # L_fd：跨模態特徵去相關化 + 對齊（Barlow Twins 風格，見論文 §3.2）
+            # L_fd：跨模態特徵去相關化 + 對齊（Barlow Twins 風格）
             loss_fd = lfd_loss(z_speech_aligned, z_text, lambda_offdiag=lambda_off)
             loss_fd_value = float(loss_fd.detach().item())
 
             # 將 L_fd 以 tau * w_t 的權重加到總損失（對齊論文式 (13)）
-            loss = loss + tau * w_t * loss_fd  # 參考：論文 (13) 與說明文字。:contentReference[oaicite:1]{index=1}
+            loss = loss + tau * w_t * loss_fd
 
         # 反向傳播與最佳化
         optimizer.zero_grad(set_to_none=True)
         if scaler is not None:
-            # AMP：縮放 loss 後反傳，避免半精度下的 underflow
             scaler.scale(loss).backward()
-
             # 先取消縮放再做梯度裁剪（包含 decoder / s_proj / t_embed / t_proj）
             trainable_params = (
                 list(decoder.parameters()) +
@@ -438,11 +407,9 @@ def train_one_epoch(
             )
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=5.0)
-
             scaler.step(optimizer)
             scaler.update()
         else:
-            # 純 FP32 模式
             loss.backward()
             trainable_params = (
                 list(decoder.parameters()) +
@@ -453,45 +420,35 @@ def train_one_epoch(
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=5.0)
             optimizer.step()
 
-        # 每步更新進度條資訊（將詳細資訊放在進度條中）
+        # 每步更新進度條資訊（精簡：step / loss / diff，若有 L_fd 再顯示 lfd）
         loss_diff_val  = float(loss_diff.detach().item())
         total_loss_val = float(loss.detach().item())
-
-        # 準備進度條顯示資訊
         postfix_info = {
             "step": global_step,
             "loss": f"{total_loss_val:.3f}",
             "diff": f"{loss_diff_val:.3f}",
-            "val_loss": "-",  # 訓練期間顯示待計算
-            "val_cer": "-"    # 訓練期間顯示待計算
         }
-
-        if apply_lfd:
+        if loss_fd_value is not None:
             postfix_info["lfd"] = f"{loss_fd_value:.3f}"
-
-        # 更新進度條（每步都更新）
         try:
             pbar.set_postfix(postfix_info)
         except Exception:
             pass
 
-        # 累積 epoch 統計（用於平均 loss）
-        epoch_loss_sum += float(loss.detach().item())
+        # 累積 epoch 統計
+        epoch_loss_sum += total_loss_val
         epoch_step_cnt += 1
         global_step += 1
 
     # 計算並回傳「本 epoch 平均訓練 loss」
     avg_loss = (epoch_loss_sum / max(1, epoch_step_cnt))
-
-    # 可選：在函式結尾印出總結（避免與 main() 的列印重複，預設關閉）
     if print_epoch_summary:
         print(f"[Summary] Epoch {epoch} Avg Train Loss: {avg_loss:.4f}", flush=True)
-
     return global_step, avg_loss
 
 
 # ============ 訓練 CER 計算函數 ============
-# CER 評估相關函數已移至 models/evaluate.py
+
 
 def main():
     parser = argparse.ArgumentParser(description="FDDM-ASR Training Script")
@@ -534,7 +491,6 @@ def main():
     # ==== Scheduler ====
     if not _SCHED_IMPORT_OK:
         raise ImportError("請把 DiscreteDiffusionScheduler 加入匯入路徑，或修改 train.py 上方的 import。")
-    # 使用正確的參數初始化 scheduler：K (vocab_size), T (diffusion steps), device, beta_max
     scheduler = SchedulerAdapter(DiscreteDiffusionScheduler(
         K=vocab, 
         T=cfg.diffusion['T'], 
@@ -547,7 +503,6 @@ def main():
     optim = torch.optim.AdamW(params, lr=cfg.optim['lr'], weight_decay=cfg.optim['weight_decay'])
     
     # ==== AMP GradScaler ====
-    # 提升數值穩定性和訓練效率，特別適用於 FP16 訓練
     scaler = amp.GradScaler('cuda') if torch.cuda.is_available() else None
     if scaler is not None:
         print("AMP 已啟用：使用混合精度訓練以提升效能和數值穩定性")
@@ -606,7 +561,6 @@ def main():
     os.makedirs(cfg.log['ckpt_dir'], exist_ok=True)
     global_step = 1
     
-    # 初始化最佳權重追蹤
     best_val_cer = float('inf')  # 初始化為無限大
     best_epoch = 0
     
@@ -618,39 +572,22 @@ def main():
             scaler  # 傳入 AMP GradScaler
         )
         
-        print(f"Epoch {epoch} Train Loss: {train_loss:.4f}")
-        
-        # 每個 epoch 結束後進行驗證
+        # —— 每個 epoch 結束後：驗證（如有）——
+        val_loss = None
+        val_cer  = None
         if val_loader is not None:
             val_cer = evaluate_cer_with_jumpy_sampling(
                 encoder, decoder, scheduler, val_loader, device, cfg, tokenizer
             )
-            # 計算驗證損失
             val_loss = evaluate_validation_loss(
                 encoder, decoder, s_proj, t_embed, t_proj,
                 scheduler, val_loader, device, cfg
             )
-            print(f"Epoch {epoch} Validation CER: {val_cer:.4f} | Validation Loss: {val_loss:.4f}")
-            
-            # 更新進度條顯示驗證資訊
-            try:
-                # 為進度條添加驗證資訊
-                pbar.set_postfix({
-                    "epoch": epoch,
-                    "train_loss": f"{train_loss:.3f}",
-                    "val_loss": f"{val_loss:.3f}",
-                    "val_cer": f"{val_cer:.3f}"
-                })
-            except Exception:
-                pass
-            
-            # 檢查是否為最佳驗證 CER
+
+            # 更新最佳權重
             if val_cer < best_val_cer:
                 best_val_cer = val_cer
                 best_epoch = epoch
-                print(f"New best validation CER: {best_val_cer:.4f} at epoch {best_epoch}")
-                
-                # 保存最佳權重
                 best_ckpt = {
                     'decoder': decoder.state_dict(),
                     's_proj': s_proj.state_dict(),
@@ -663,15 +600,25 @@ def main():
                 }
                 best_path = os.path.join(cfg.log['ckpt_dir'], 'best_model.pt')
                 torch.save(best_ckpt, best_path)
-                print(f"Saved best model to: {best_path}")
-        
-        # 每個 epoch 結束後進行測試
+                print(f"Saved BEST model (epoch {best_epoch}, val_cer {best_val_cer:.4f}) → {best_path}")
+
+        # —— 每個 epoch 結束後：測試（如有）——
+        test_cer = None
         if test_loader is not None:
             test_cer = evaluate_cer_with_jumpy_sampling(
                 encoder, decoder, scheduler, test_loader, device, cfg, tokenizer
             )
-            print(f"Epoch {epoch} Test CER: {test_cer:.4f}")
-        
+
+        # —— 統一列印「Epoch 摘要」：只在這裡輸出驗證/測試指標 —— 
+        msg = f"[Epoch {epoch} Summary] train_loss={train_loss:.4f}"
+        if val_loss is not None:
+            msg += f" | val_loss={val_loss:.4f}"
+        if val_cer is not None:
+            msg += f" | val_cer={val_cer:.4f}"
+        if test_cer is not None:
+            msg += f" | test_cer={test_cer:.4f}"
+        print(msg)
+
         # 儲存每個 epoch 的權重（用於恢復訓練）
         ckpt = {
             'decoder': decoder.state_dict(),
