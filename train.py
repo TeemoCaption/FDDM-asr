@@ -48,6 +48,13 @@ from models.evaluate import (
 )  # 匯入評估函數
 from losses.fddm_losses import lfd_loss
 
+# 進度條（若沒安裝也能安全退回）
+try:
+    from tqdm import tqdm
+except Exception:
+    tqdm = None
+
+
 # ====== 重要提醒：Tokenizer 特殊 Token 對應 ======
 # 在導入真實資料時，請確保以下 token 與 tokenizer 設定一致：
 # - pad_id: padding token ID（通常為 0）
@@ -275,6 +282,23 @@ class SchedulerAdapter:
                 return out
             return torch.ones_like(t, dtype=torch.float32)
 
+def _iter_with_progress(loader, desc: str, total: int | None = None):
+    """
+    將 DataLoader 包上 tqdm。若環境沒有 tqdm，就印出描述字串後直接回傳原 loader。
+    參數：
+        loader: 任何可疊代的資料載入器
+        desc  : tqdm 左側的說明字串
+        total : 總長度（若不傳，tqdm 會嘗試 len(loader)）
+    """
+    if tqdm is not None:
+        try:
+            return tqdm(loader, total=(total if total is not None else len(loader)), desc=desc, leave=False)
+        except Exception:
+            return tqdm(loader, desc=desc, leave=False)
+    else:
+        print(desc, flush=True)
+        return loader
+
 # ============ 訓練主流程 ============
 def train_one_epoch(
     encoder: AcousticEncoder,
@@ -288,138 +312,172 @@ def train_one_epoch(
     device: torch.device,
     cfg: Config,
     global_step: int,
-    scaler: GradScaler = None,  # 添加 AMP scaler 參數
-) -> tuple[int, float]:  # 返回 global_step 和平均訓練損失
-    encoder.eval()   # 預設凍結
+    scaler: amp.GradScaler = None,  # AMP 混合精度的縮放器（可為 None）
+    epoch: int = 1,                 # 目前第幾個 epoch：只用來顯示在進度條上
+) -> tuple[int, float]:
+    """
+    單一 epoch 的訓練流程，含進度條與即時統計。
+
+    參數說明：
+        encoder  : 聲學編碼器（通常凍結，用於抽取條件 c）
+        decoder  : 擴散模型的去噪解碼器，輸出對 x_0 的 logits
+        s_proj   : 語音側投影頭（L_fd 用到）
+        t_embed  : 文本側嵌入頭（吃 logits 或 token，用於 L_fd）
+        t_proj   : 文本側投影頭（L_fd 用到）
+        scheduler: Diffusion 時間排程與 KL 計算的介面（Adapter）
+        loader   : 訓練 DataLoader
+        optimizer: 參數最佳化器
+        device   : torch.device
+        cfg      : 超參數設定（需包含 data/diffusion/lfd/log/optim 等欄位）
+        global_step: 目前全域步數（會被持續累加）
+        scaler   : AMP 的 GradScaler（若為 None 則使用 FP32 訓練）
+        epoch    : 目前 epoch 編號
+
+    回傳：
+        (global_step, avg_train_loss)
+    """
+    # 模式設定：通常 encoder 凍結評估模式，其餘訓練
+    encoder.eval()
     decoder.train()
     s_proj.train()
     t_embed.train()
     t_proj.train()
 
-    pad_id = cfg.data['pad_id']
-    T_total = cfg.diffusion['T']
-    log_every = cfg.log['log_every']
+    pad_id   = cfg.data['pad_id']          # <pad> 的 token id（用於 mask）
+    T_total  = cfg.diffusion['T']          # 擴散總步數（訓練用）
+    log_every = cfg.log['log_every']       # 幾步列印一次訓練日誌
+    n_step_fd = cfg.lfd['n_step_fd']       # 每隔多少 step 加一次 L_fd
+    tau       = cfg.lfd.get('tau', 1.0)    # L_fd 的整體權重
+    lambda_off = cfg.lfd['lambda_offdiag'] # L_fd 的 off-diagonal 懲罰
 
-    # 初始化訓練損失累積器
+    # 用 tqdm 包住 DataLoader；若環境沒裝 tqdm，_iter_with_progress 會自動退回印字
+    pbar = _iter_with_progress(loader, desc=f"Epoch {epoch} [train]")
+
+    # 累積 epoch 平均損失
     epoch_loss_sum = 0.0
-    epoch_step_count = 0
+    epoch_step_cnt = 0
 
-    for batch_idx, (wave, x0) in enumerate(loader, start=1):
+    # 注意：pbar 產出的是「batch」，要拿到 batch_idx 就用 enumerate(pbar, 1)
+    for batch_idx, batch in enumerate(pbar, 1):
+        wave, x0 = batch                     # wave: [B, T_wav]；x0: [B, L]
         wave = wave.to(device)
-        x0 = x0.to(device)
+        x0   = x0.to(device)
         B, L = x0.shape
 
-        # 取聲學條件 c = c_psi(s)
-        # 注意：即使編碼器被凍結，我們仍然需要它的輸出來計算梯度
-        with amp.autocast('cuda'):  # AMP: 混合精度前向傳播
-            c, c_mask, _ = encoder(wave)   # [B, S, d]
+        # 取聲學條件 c = c_psi(s)；即便 encoder 不更新，也需要前向抽條件
+        # 使用 AMP 自動混合精度可加速並降低顯存（cuda 上生效）
+        with amp.autocast('cuda'):
+            c, c_mask, _ = encoder(wave)     # c: [B, S, d], c_mask: [B, S]
 
-        # 抽樣時間步 t ~ U[1, T]
-        t = torch.randint(1, T_total+1, (B,), device=device)
+        # 隨機抽樣擴散時間步 t ~ Uniform{1..T}
+        t = torch.randint(1, T_total + 1, (B,), device=device)
 
-        # 前向擴散得到 x_t
-        xt = scheduler.sample_q(x0, t)     # [B, L]
+        # 前向擴散：由 x0 生成 xt（離散）
+        xt = scheduler.sample_q(x0, t)       # [B, L]，整數 token ids
 
-        # 解碼器 f_theta(xt, t, c) -> logits 對 x_0 的分佈
-        # 注意：x_mask 排除 padding token，確保模型不學習預測 padding
-        with amp.autocast('cuda'):  # AMP: 混合精度前向傳播
-            logits = decoder(xt, t, c, x_mask=(x0!=pad_id), c_mask=c_mask)  # [B, L, V]
+        # 解碼器估計 x_0 的分佈：f_theta(xt, t, c) -> logits_x0
+        with amp.autocast('cuda'):
+            logits = decoder(
+                xt, t, c,
+                x_mask=(x0 != pad_id),       # 排除 <pad>，避免模型學到 pad
+                c_mask=c_mask
+            )                                # [B, L, V]
 
-        # 建立 token mask（排除 padding）
-        x_mask = (x0 != pad_id)  # [B, L] True=有效 token
-        
-        # Diffusion KL（論文 Eq.(6)）
-        loss_diff = scheduler.kl_term(xt, x0, logits, t, x_mask)  # 傳入 mask 進行精確計算
-        
-        # 初始化總損失
-        loss = loss_diff
-        loss_fd_value = 0.0  # 用於日誌記錄
-        
-        # 每 n_step_fd 次加入 L_fd（論文 3.3）
-        n_step_fd = cfg.lfd['n_step_fd']
+        # 有效 token 的 mask（True=有效）
+        x_mask = (x0 != pad_id)
+
+        # 主要損失：Diffusion KL（論文 Eq.(6)）
+        loss_diff = scheduler.kl_term(xt, x0, logits, t, x_mask)  # scalar
+
+        # 是否在此步套用跨模態對齊損失 L_fd（論文 §3.3）
         apply_lfd = (global_step % n_step_fd) == 0
-        
+        loss = loss_diff
+        loss_fd_value = 0.0  # 只用於日誌顯示
         if apply_lfd:
-            lambda_off = cfg.lfd['lambda_offdiag']
-            tau = cfg.lfd.get('tau', 1.0)
-            
-            # 計算跨模態特徵投影
-            with amp.autocast('cuda'):  # AMP: 混合精度前向傳播
-                z_text = t_proj(t_embed(logits))  # [B, L, d_proj]
-                z_speech = s_proj(c)             # [B, S, d_proj]
-            
-            # 對齊序列長度（語音特徵通常比文字長）
+            # 文字側特徵：先將 logits（對 x_0 的分佈）經 t_embed/t_proj 投影
+            with amp.autocast('cuda'):
+                z_text   = t_proj(t_embed(logits))   # [B, L, d_proj]
+                z_speech = s_proj(c)                 # [B, S, d_proj]
+
+            # 對齊語音/文字的時間長度以便計算 L_fd
             S = z_speech.size(1)
             if S >= L:
-                z_speech_aligned = z_speech[:, :L, :]  # 截取前 L 個時間步
+                z_speech_aligned = z_speech[:, :L, :]
             else:
-                # 重複最後一個時間步來補齊
                 pad = z_speech[:, -1:, :].repeat(1, L - S, 1)
                 z_speech_aligned = torch.cat([z_speech, pad], dim=1)
-            
-            # 計算權重 w_t = ∏_{s=1}^t (1-β_s)
-            w_t = scheduler.w_t(t).mean()  # 對 batch 取平均
-            
-            # 計算 L_fd 損失
+
+            # w_t = ∏_{s=1}^t (1-β_s)（對 batch 先取平均做 scalar 權重）
+            w_t = scheduler.w_t(t).mean()
+
+            # L_fd：跨模態特徵去相關化 + 對齊（詳見 losses/lfd_loss）
             loss_fd = lfd_loss(z_speech_aligned, z_text, lambda_offdiag=lambda_off)
-            loss_fd_value = loss_fd.detach().item()  # 記錄數值用於日誌
-            
-            # 加入總損失
+            loss_fd_value = float(loss_fd.detach().item())
+
+            # 將 L_fd 以 tau * w_t 的權重加到總損失
             loss = loss + tau * w_t * loss_fd
 
+        # 反向傳播與最佳化
         optimizer.zero_grad(set_to_none=True)
-        
-        # AMP: 使用 GradScaler 進行反向傳播
+
         if scaler is not None:
+            # AMP：縮放 loss 後反傳，避免半精度下的 underflow
             scaler.scale(loss).backward()
-            
-            # 擴展梯度裁剪範圍：包含所有可訓練模型參數
-            # 避免梯度爆炸，提升訓練穩定性
-            all_trainable_params = (
+
+            # 先取消縮放，再做梯度裁剪（包含所有可訓練模組）
+            trainable_params = (
                 list(decoder.parameters()) +
                 list(s_proj.parameters()) +
                 list(t_embed.parameters()) +
                 list(t_proj.parameters())
             )
-            scaler.unscale_(optimizer)  # 取消縮放以進行梯度裁剪
-            torch.nn.utils.clip_grad_norm_(all_trainable_params, 5.0)
-            
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=5.0)
+
             scaler.step(optimizer)
             scaler.update()
         else:
-            # 非 AMP 模式：傳統反向傳播
+            # 純 FP32 模式
             loss.backward()
-            
-            # 擴展梯度裁剪範圍：包含所有可訓練模型參數
-            # 避免梯度爆炸，提升訓練穩定性
-            all_trainable_params = (
+
+            trainable_params = (
                 list(decoder.parameters()) +
                 list(s_proj.parameters()) +
                 list(t_embed.parameters()) +
                 list(t_proj.parameters())
             )
-            torch.nn.utils.clip_grad_norm_(all_trainable_params, 5.0)
-            
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=5.0)
             optimizer.step()
 
+        # 週期性日誌 + 進度條尾註
         if (global_step % log_every) == 0:
-            loss_diff_value  = loss_diff.detach().item()
-            total_loss_value = loss.detach().item()
-            log_msg = f"step={global_step} loss_diff={loss_diff_value:.4f}"
+            loss_diff_val  = float(loss_diff.detach().item())
+            total_loss_val = float(loss.detach().item())
+            msg = f"step={global_step} loss_diff={loss_diff_val:.4f}"
             if apply_lfd:
-                log_msg += f" loss_fd={loss_fd_value:.4f} w_t={float(w_t):.4f}"  # w_t 通常不需要梯度
-            log_msg += f" total_loss={total_loss_value:.4f}"
-            print(log_msg)
-        
-        # 累積訓練損失
-        epoch_loss_sum += total_loss_value
-        epoch_step_count += 1
-        
+                msg += f" loss_fd={loss_fd_value:.4f}"
+            msg += f" total_loss={total_loss_val:.4f}"
+            print(msg, flush=True)
+
+            # 讓 tqdm 面板即時顯示目前損失
+            try:
+                pbar.set_postfix({
+                    "loss": f"{total_loss_val:.3f}",
+                    "diff": f"{loss_diff_val:.3f}",
+                    **({"lfd": f"{loss_fd_value:.3f}"} if apply_lfd else {})
+                })
+            except Exception:
+                pass
+
+        # 累積 epoch 統計
+        epoch_loss_sum += float(loss.detach().item())
+        epoch_step_cnt += 1
         global_step += 1
-    
-    # 計算平均訓練損失
-    avg_train_loss = epoch_loss_sum / epoch_step_count if epoch_step_count > 0 else 0.0
-    return global_step, avg_train_loss
+
+    # 回傳平均訓練損失（可搭配你在 main() 的列印）
+    avg_loss = (epoch_loss_sum / epoch_step_cnt) if epoch_step_cnt > 0 else 0.0
+    return global_step, avg_loss
+
 
 # ============ 訓練 CER 計算函數 ============
 # CER 評估相關函數已移至 models/evaluate.py
