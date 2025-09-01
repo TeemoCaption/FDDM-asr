@@ -1,6 +1,7 @@
 # 核心深度學習框架
 torch>=2.0.0
 torchaudio>=2.0.0
+torchvision>=0.15.0
 
 # Transformer 模型和 tokenizer
 transformers>=4.30.0
@@ -10,9 +11,18 @@ sentencepiece>=0.1.99
 pandas>=1.5.0
 librosa>=0.10.0
 soundfile>=0.12.0
+numpy>=1.24.0
+scipy>=1.10.0
 
 # 資料集載入
 datasets>=2.12.0,<4.0.0
 
 # 配置檔案處理
 pyyaml>=6.0
+
+# 進度顯示
+tqdm>=4.65.0
+
+# 可選：用於視覺化或額外功能
+# matplotlib>=3.7.0
+# scikit-learn>=1.3.0
