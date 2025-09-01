@@ -99,9 +99,8 @@ data/
 # 忽略 raw 資料夾內的所有內容
 data/raw/*
 
-# 可選：如果您想在 raw 資料夾內保留一個說明檔案
-!data/raw/.gitkeep
-!data/raw/README.md
+# 忽略 processed 資料夾的所有內容（包含 clips/ 子資料夾和所有處理後的資料檔案）
+data/processed/
 
 # 臨時檔案
 *.tmp
