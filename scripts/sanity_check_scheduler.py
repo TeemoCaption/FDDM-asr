@@ -2,11 +2,12 @@
 import json, torch
 from fddm.sched.diffusion_scheduler import DiscreteDiffusionScheduler
 
-# 讀 tokenizer 的 vocab.json 以取得 K
-sp_json = "data/tokenizer/zh-TW_A/vocab.json"
-with open(sp_json, "r", encoding="utf-8") as f:
-    vocab = json.load(f)
-K = int(vocab["vocab_size"])
+# 讀取配置檔案以取得 vocab_size，而非硬編碼路徑
+import yaml
+config_path = "configs/fddm_zhTW_base.yaml"
+with open(config_path, "r", encoding="utf-8") as f:
+    config = yaml.safe_load(f)
+K = int(config["data"]["vocab_size"])
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 sched = DiscreteDiffusionScheduler(K=K, T=200, device=device)

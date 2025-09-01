@@ -16,6 +16,8 @@ data:
   manifest_train: data/processed/train.json
   manifest_dev:   data/processed/validation.json  # 使用 Hugging Face 內建的 validation 分割
   manifest_test:  data/processed/test.json  # 使用 Hugging Face 內建的 test 分割
+  # tokenizer 路徑（與 tokenizer_zhTW.yaml 對齊）
+  tokenizer_path: data/tokenizer/zh-TW_A/spm_zhTW_A.model
   # tokenizer 參數（與 tokenizer_zhTW.yaml 對齊）
   vocab_size: 8000
 
