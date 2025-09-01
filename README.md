@@ -141,7 +141,18 @@ python scripts/preprocess.py --dataset_name "cv-corpus-22.0-2025-06-20"
 python scripts/tokenizer_train.py --config configs/tokenizer_zhTW.yaml
 ```
 
-### 5. 模型推論
+### 5. 開始訓練
+```bash
+python train.py --config configs/fddm_zhTW_base.yaml
+```
+
+訓練時會自動：
+- 載入 train/validation/test 資料集
+- 每個 epoch 結束後計算 CER
+- 自動保存最佳驗證權重
+- 顯示完整的訓練日誌
+
+### 6. 模型推論
 
 #### 單一音檔推論
 ```bash
