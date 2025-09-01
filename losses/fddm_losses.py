@@ -29,7 +29,7 @@ def _standardize(x: torch.Tensor, eps: float = 1e-5) -> Tuple[torch.Tensor, torc
 def lfd_loss(
     z_a: torch.Tensor,   # [B, T, D] 語音投影後特徵（SpeechProjector 輸出）
     z_b: torch.Tensor,   # [B, T, D] 文字投影後特徵（TextProjector 輸出）
-    lambda_offdiag: float = 1.0,
+    lambda_offdiag: float = 5.0e-3,  # 調整預設值為 5e-3（與配置檔一致）
     eps: float = 1e-5,
 ) -> torch.Tensor:
     B, T, D = z_a.shape

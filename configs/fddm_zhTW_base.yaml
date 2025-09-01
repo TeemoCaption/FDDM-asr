@@ -42,6 +42,46 @@ diffusion:
   beta_max: 0.2     # cosine 排程的噪聲上限，可在 0.1~0.3 間微調
   # 其餘如 β_t, M_t 由 DiscreteDiffusionScheduler 提供
 
+# ==== Inference / Jumpy Sampling ====
+inference:
+  # 推論時的擴散步數（通常遠小於訓練時的 T）
+  T_infer: 20
+  
+  # 跳步採樣參數
+  jumpy_sampling:
+    r: 2                    # 每次跳躍的步數（Δ），可選 2, 5, 10 等
+    greedy: true            # true: argmax 採樣；false: categorical 採樣
+    temperature: 1.0        # 採樣溫度（僅在 greedy=false 時生效）
+    
+    # 後驗模式："average" 或 "max"
+    posterior_mode: "average"
+    
+    # 採樣模式："exact" 或 "fast"
+    # - "exact": 使用論文 Algorithm 2 的嚴格多步後驗 q(x_{t-Δ}|x_t,x̂0)
+    #            包含完整的轉移矩陣積 M^Δ 項，精度高但計算量大
+    # - "fast":  使用 ᾱ_t 與均勻分布凸組合的快速近似
+    #            計算效率高但忽略 x_t 信息，精度略低
+    sampling_mode: "exact"   # 預設使用精確模式以獲得最佳品質
+    
+    # 初始化方式："uniform" 或 "random"
+    init: "uniform"
+    
+    # === 採樣模式選擇建議 ===
+    # 精確模式 (exact)：
+    #   - 優點：嚴格遵循論文 Algorithm 2，理論上最優
+    #   - 缺點：計算複雜度較高，推論時間較長
+    #   - 適用：追求最佳品質的場景
+    #
+    # 快速模式 (fast)：
+    #   - 優點：計算效率高，推論速度快
+    #   - 缺點：忽略當前狀態 x_t 的信息，可能略降品質
+    #   - 適用：需要快速推論的實時場景
+    #
+    # 建議 sweep 參數：
+    #   - r: [1, 2, 5, 10]（較大的 r 推論更快但可能品質下降）
+    #   - sampling_mode: ["exact", "fast"]（比較兩種模式的效果）
+    #   - T_infer: [10, 20, 50]（推論步數與品質的權衡）
+
 # ==== Optimization ====
 optim:
   batch_size: 4
@@ -50,14 +90,43 @@ optim:
   num_epochs: 10
   grad_accum_steps: 1
   warmup_steps: 1000
+  
+  # === 超參數 Sweep 建議 ===
+  # 學習率 sweep 區間：[1e-4, 2e-4, 5e-4, 1e-3]
+  # batch_size sweep 區間：[2, 4, 8, 16]（依顯存調整）
 
 # ==== Feature Decorrelation (L_fd) ====
+# 論文 3.2-3.3 節：跨模態特徵去相關損失
+# L_fd = Σ_j (1 - C_jj)^2 + λ Σ_j Σ_{k!=j} C_jk^2
 lfd:
-  lambda_offdiag: 1.0
-  n_step_fd: 4      # 每 4 步加入一次 L_fd（論文 3.3 的「每 n 次 iteration」）
-  tau: 1.0          # 論文中的 τ（可先設 1.0）
+  # λ 參數：控制非對角線項的懲罰強度
+  lambda_offdiag: 5.0e-3  # 預設 5e-3（Barlow Twins 常見量級）
+  
+  # 每幾步併入一次 L_fd（論文 3.3 節的「每 n 次 iteration」策略）
+  n_step_fd: 4            # 每 4 步加入一次 L_fd，可調整為 1（每步）或更大值
+  
+  # τ 參數：L_fd 的總體縮放係數
+  tau: 1.0                # 論文中的 τ，控制 L_fd 相對於 L_cvb 的權重
+  
+  # === 超參數調整建議與 Sweep 區間 ===
+  # lambda_offdiag 調整指南：
+  #   - 太小 (< 1e-3)：跨模態對齊效果弱
+  #   - 太大 (> 1e-2)：可能過度約束，影響主任務性能
+  #   - 建議 sweep 區間：[1e-3, 2e-3, 5e-3, 1e-2, 2e-2]
+  
+  # n_step_fd 調整指南：
+  #   - n=1：每步都計算 L_fd，訓練穩定但計算成本高
+  #   - n=4-8：平衡計算成本與效果
+  #   - n>10：L_fd 更新頻率過低，可能影響對齊效果
+  #   - 建議 sweep 區間：[1, 2, 4, 8, 16]
+  
+  # tau 調整指南：
+  #   - 控制 L_fd 在總損失中的比重
+  #   - 建議 sweep 區間：[0.1, 0.5, 1.0, 2.0, 5.0]
 
 # ==== Logging / Checkpoint ====
 log:
   log_every: 50
   ckpt_dir: ckpts/fddm_zhTW_base
+  # 推論時是否記錄採樣模式信息
+  log_sampling_info: true

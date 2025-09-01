@@ -85,7 +85,7 @@ class ModelAdapter:
 
 class DiffusionJumpySampler:
     """
-    Multinomial/離散擴散的 Jumpy Sampling 實作。
+    Multinomial/離散擴散的 Jumpy Sampling 實作，支援精確模式和快速模式。
 
     重要超參
     --------
@@ -93,10 +93,12 @@ class DiffusionJumpySampler:
     - r:      每次跳步長（Δ），如 2 或 5
     - greedy: True 時以 argmax 取樣；False 時使用 Categorical 抽樣
     - posterior_mode: "average" or "max"，對應「平均後驗 / 最大後驗」兩種近似
+    - sampling_mode: "exact" or "fast"，控制使用精確或快速採樣模式
     - temperature: 取樣溫度；>1 更隨機，<1 更保守（僅在 greedy=False 時生效）
 
-    註：本實作以 ᾱ_t 與「與均勻分布的凸組合」作為 q(x_t | x₀) 的近似，
-    以此構造 x_{t-Δ} 的分佈；是原論文快速取樣精神的近似化實用版本。
+    採樣模式說明：
+    - "exact": 使用論文 Algorithm 2 的嚴格多步後驗 q(x_{t-Δ}|x_t,x̂0)，包含完整的 M^Δ 項
+    - "fast": 使用 ᾱ_t 與均勻分布凸組合的快速近似，計算效率更高但精度略低
     """
 
     def __init__(
@@ -109,6 +111,7 @@ class DiffusionJumpySampler:
         r: int = 2,
         greedy: bool = True,
         posterior_mode: Literal["average", "max"] = "average",
+        sampling_mode: Literal["exact", "fast"] = "exact",  # 新增：控制採樣精確度
         temperature: float = 1.0,
         device: Optional[torch.device] = None,
     ):
@@ -120,6 +123,7 @@ class DiffusionJumpySampler:
         self.r = int(r)
         self.greedy = bool(greedy)
         self.posterior_mode = posterior_mode
+        self.sampling_mode = sampling_mode  # 採樣模式控制
         self.temperature = float(temperature)
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -134,9 +138,10 @@ class DiffusionJumpySampler:
     # ---------------------------
     def _mix_with_uniform(self, p_x0: Tensor, alpha_bar_t: Tensor) -> Tensor:
         """
-        依 ᾱ_t 與均勻分布做凸組合：
-            q(x_t | x₀) ≈ ᾱ_t * p(x₀) + (1 - ᾱ_t) * U
+        快速模式：依 ᾱ_t 與均勻分布做凸組合近似後驗
+            q(x_{t-Δ} | x₀) ≈ ᾱ_{t-Δ} * p(x₀) + (1 - ᾱ_{t-Δ}) * U
         其中 U 為 K 類均勻分佈；此處 p(x₀) 用模型 softmax(logits_x0) 近似。
+        這是原始快速採樣的近似方法，計算效率高但忽略了 x_t 的信息。
         """
         B, L, K = p_x0.shape
         u = torch.full((1, 1, K), 1.0 / K, device=p_x0.device, dtype=p_x0.dtype)
@@ -166,8 +171,11 @@ class DiffusionJumpySampler:
         t_scalar: int,      # 目前步數（int, 1..T_infer）
         delta: int,         # 本次要跳的步數（通常等於 r；若 t 不足則為 t）
         cond_c: Tensor,     # [B, N, D] 聲學條件
+        seq_len: int,       # 序列長度
     ) -> Tuple[Tensor, Tensor]:
         """
+        單次跳躍採樣，支援精確模式和快速模式
+        
         回傳：
             x_t_minus_delta_idx: [B, L]，跳後的新索引
             p_x0: [B, L, K]，本次模型的 x̂₀ 概率（可在最後用來 Greedy 解碼）
@@ -180,15 +188,27 @@ class DiffusionJumpySampler:
         logits_x0 = self.model.predict_x0_logits(x_t_idx, t_tensor, cond_c)  # [B, L, K]
         p_x0 = F.softmax(logits_x0, dim=-1)  # [B, L, K]
 
-        # 根據 alpha_bar 的閉式混合，近似 p(x_{t-Δ} | x_t, x̂₀)
-        #   - 「average」：使用 mix_with_uniform(p_x0, ᾱ_{t-Δ}) 作為 x_{t-Δ} 分佈
-        #   - 「max」：    在 average 基礎上取 argmax（類似 Maximum Posterior）
-        #   註：若要更嚴謹地結合 x_t，可在此乘上前向 Δ 步轉移機率（需要 M^{Δ}），
-        #       但 uniform 轉移下此近似通常已足夠實用。
-        t_minus_delta = max(0, t_scalar - delta)
-        alpha_bar_tmd = self._alpha_bar_at_t_train(t_minus_delta)  # 使用訓練時間軸的 ᾱ
-        p_xtmd = self._mix_with_uniform(p_x0, alpha_bar_tmd)       # [B, L, K]
+        # 根據採樣模式選擇不同的後驗計算方法
+        if self.sampling_mode == "exact":
+            # 精確模式：使用論文 Algorithm 2 的嚴格多步後驗
+            # 將離散索引轉換為機率分佈格式（one-hot）
+            xt_onehot = torch.zeros(B, seq_len, self.K, device=device)
+            xt_onehot.scatter_(-1, x_t_idx.unsqueeze(-1), 1.0)  # [B, L, K]
+            
+            # 使用精確的多步後驗方法 q(x_{t-Δ}|x_t, x̂₀)
+            # 包含完整的轉移矩陣積 M_{t:t-Δ+1} 項，對應論文式(4)(5)的多步推廣
+            p_xtmd = self.scheduler.q_posterior_multi_step(
+                xt_onehot, p_x0, t_tensor, delta
+            )  # [B, L, K]
+            
+        else:  # sampling_mode == "fast"
+            # 快速模式：使用 ᾱ_t 與均勻分布的凸組合近似
+            # 這忽略了 x_t 的具體信息，但計算效率更高
+            target_t = max(0, t_scalar - delta)
+            alpha_bar_target = self._alpha_bar_at_t_train(target_t)
+            p_xtmd = self._mix_with_uniform(p_x0, alpha_bar_target)  # [B, L, K]
 
+        # 根據 posterior_mode 決定取樣策略
         if self.posterior_mode == "max":
             x_t_minus_delta_idx = p_xtmd.argmax(dim=-1)
         else:
@@ -226,7 +246,16 @@ class DiffusionJumpySampler:
         init: Literal["uniform", "random"] = "uniform",
     ) -> Tuple[Tensor, Tensor]:
         """
-        以 Jumpy Sampling 從 x_T 逐步跳到 x_0，回傳「最終索引序列」與「最後一次的 p(x̂₀)」。
+        以 Jumpy Sampling 從 x_T 逐步跳到 x_0，支援精確和快速兩種模式。
+
+        參數
+        ----
+        cond_c : Tensor [B, N, D]
+            聲學條件（WavLM-Large 輸出）
+        seq_len : int
+            輸出文字序列長度
+        init : Literal["uniform", "random"]
+            初始化方式
 
         回傳
         ----
@@ -235,9 +264,10 @@ class DiffusionJumpySampler:
         p_x0_last : FloatTensor [B, L, K]
             最後一次模型對 x̂₀ 的分佈（常拿來做 Greedy 解碼或計分）
 
-        備註
-        ----
-        - 若你希望在每個 t 皆保留 p_x0，可在 _jump_once 時把 p_x0 收集起來。
+        採樣模式說明
+        -----------
+        - exact: 使用論文 Algorithm 2 的嚴格多步後驗，精度高但計算量大
+        - fast: 使用 ᾱ_t 近似，計算效率高但可能精度略低
         """
         B = cond_c.size(0)
         device = cond_c.device
@@ -254,10 +284,24 @@ class DiffusionJumpySampler:
 
         while t > 0:
             delta = min(self.r, t)
-            x_t_idx, p_x0_last = self._jump_once(x_t_idx, t_scalar=t, delta=delta, cond_c=cond_c)
+            x_t_idx, p_x0_last = self._jump_once(x_t_idx, t_scalar=t, delta=delta, cond_c=cond_c, seq_len=seq_len)
             t -= delta
 
-        # 可再做一次最終 Greedy：對 p_x0_last 取 argmax 作為最終輸出
-        #    若希望直接以 x_t_idx 作輸出，也可視需求替換。
+        # 最終輸出處理：對 p_x0_last 取 argmax 作為最終序列
+        # 這確保了最終輸出是基於模型對 x̂₀ 的最佳預測
         x_0_idx = p_x0_last.argmax(dim=-1)
         return x_0_idx, p_x0_last
+    
+    def get_sampling_info(self) -> dict:
+        """
+        回傳當前採樣器的配置信息，便於調試和記錄
+        """
+        return {
+            "sampling_mode": self.sampling_mode,
+            "posterior_mode": self.posterior_mode,
+            "T_infer": self.T_infer,
+            "r": self.r,
+            "greedy": self.greedy,
+            "temperature": self.temperature,
+            "K": self.K
+        }

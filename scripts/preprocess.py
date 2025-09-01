@@ -128,15 +128,19 @@ def process_audio(audio_path, output_path):
     """
     處理音檔：resample到16kHz，轉單聲道
     """
-    # 載入音檔
-    y, sr = librosa.load(audio_path, sr=None)  # 保持原取樣率
-    # 如果是多聲道，取第一聲道
-    if y.ndim > 1:
-        y = y[:, 0]  # 取第一聲道
-    # resample到16kHz
-    y_resampled = librosa.resample(y, orig_sr=sr, target_sr=16000)  # 將音訊重取樣到16kHz，符合ASR常見需求
-    # 保存處理後的音檔
-    sf.write(output_path, y_resampled, 16000)  # 改用soundfile寫出WAV，避免使用已棄用的librosa.output.write_wav
+    try:
+        # 載入音檔
+        y, sr = librosa.load(audio_path, sr=None)  # 保持原取樣率
+        # 如果是多聲道，取第一聲道
+        if y.ndim > 1:
+            y = y[:, 0]  # 取第一聲道
+        # resample到16kHz
+        y_resampled = librosa.resample(y, orig_sr=sr, target_sr=16000)  # 將音訊重取樣到16kHz，符合ASR常見需求
+        # 保存處理後的音檔
+        sf.write(output_path, y_resampled, 16000)  # 改用soundfile寫出WAV，避免使用已棄用的librosa.output.write_wav
+    except Exception as e:
+        print(f"處理音檔時發生錯誤 {audio_path} -> {output_path}: {e}")
+        raise  # 重新拋出異常，讓呼叫者決定如何處理
 
 def generate_index(splits_data):
     """
@@ -158,7 +162,9 @@ def generate_index(splits_data):
 
         # 設定處理後音檔路徑
         clips_dir = os.path.join(split_dir, "clips")
-        df['processed_path'] = df['path'].apply(lambda x: os.path.join(PROCESSED_DATA_DIR, "clips", f"{split_name}_{x}"))
+        processed_clips_dir = os.path.join(PROCESSED_DATA_DIR, "clips")
+        os.makedirs(processed_clips_dir, exist_ok=True)  # 確保處理後音檔目錄存在
+        df['processed_path'] = df['path'].apply(lambda x: os.path.join(processed_clips_dir, f"{split_name}_{x}"))
 
         # 處理每個音檔
         for idx, row in df.iterrows():

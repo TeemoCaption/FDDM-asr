@@ -68,10 +68,22 @@ class DiscreteDiffusionScheduler:
         a_t = 1.0 - beta_t
         b_t = beta_t / self.K
 
-        t_prev = torch.clamp(t - 2, min=0)
-        beta_tm1 = self.betas[t_prev].view(B, 1, 1)                    # (B,1,1)
-        a_tm1 = 1.0 - beta_tm1
-        b_tm1 = beta_tm1 / self.K
+        # 處理邊界條件：當 t=1 時，t-1=0 對應 M₀=I（β₀=0 ⇒ a₀=1, b₀=0）
+        t_prev = t - 1  # t_prev 範圍是 [0, T-1]
+        
+        # 對於 t_prev=0 的情況（即 t=1），設定 a_{t-1}=1, b_{t-1}=0
+        # 對於 t_prev>0 的情況，使用 betas[t_prev-1]（因為 betas 是 1-indexed）
+        mask_t_prev_zero = (t_prev == 0).view(B, 1, 1)  # (B,1,1)
+        
+        # 當 t_prev > 0 時，取 betas[t_prev-1]；當 t_prev = 0 時，設為 0
+        beta_tm1 = torch.where(
+            mask_t_prev_zero,
+            torch.zeros_like(beta_t),  # t_prev=0 時，β₀=0
+            self.betas[torch.clamp(t_prev - 1, min=0)].view(B, 1, 1)  # t_prev>0 時，取對應的 beta
+        )
+        
+        a_tm1 = 1.0 - beta_tm1  # t_prev=0 時為 1，其他時候為 1-β_{t-1}
+        b_tm1 = beta_tm1 / self.K  # t_prev=0 時為 0，其他時候為 β_{t-1}/K
 
         ones = torch.ones_like(xt_prob)                                # (B,L,K)
 
@@ -84,10 +96,116 @@ class DiscreteDiffusionScheduler:
         # denom = x_t^T M_t x̂0 = a_t * (x_t · x̂0) + b_t * 1
         dot = (xt_prob * x0hat_prob).sum(dim=-1, keepdim=True)         # (B,L,1)
         denom = a_t * dot + b_t                                        # (B,L,1)
+        
+        # 後驗機率：q(x_{t-1}|x_t, x̂0) = (A * Bv) / denom
+        posterior = (A * Bv) / denom.clamp_min(self.eps)               # (B,L,K)
+        posterior = posterior / posterior.sum(dim=-1, keepdim=True).clamp_min(self.eps)  # 歸一化
+        
+        return posterior
 
-        post = (A * Bv) / denom.clamp_min(self.eps)
-        post = post / post.sum(dim=-1, keepdim=True).clamp_min(self.eps)
-        return post
+    @torch.no_grad()
+    def q_posterior_multi_step(self, xt_prob: torch.Tensor, x0hat_prob: torch.Tensor, t: torch.Tensor, delta: int) -> torch.Tensor:
+        """
+        多步後驗：q(x_{t-Δ}|x_t, x̂0) 的精確計算（基於論文 Algorithm 2）
+        使用轉移矩陣積 M_{t:t-Δ+1} 的閉式表達式，實現嚴格的多步跳躍
+        
+        參數說明：
+        xt_prob    : (B, L, K) x_t 的機率分佈
+        x0hat_prob : (B, L, K) 預測的 x̂0 機率分佈  
+        t          : (B,) 當前步數 (1..T)
+        delta      : int 要跳的步數 (1..t)
+        
+        回傳：
+        posterior  : (B, L, K) x_{t-Δ} 的機率分佈
+        
+        數學原理：
+        q(x_{t-Δ}|x_t, x̂0) ∝ (M_{t:t-Δ+1}^T x_t) ⊙ (M_{t-Δ} x̂0) / (x_t^T M_{t:t-Δ+1} x̂0)
+        其中 M_s = (1-β_s)I + (β_s/K)11^T，⊙ 表示 Hadamard 乘積
+        """
+        xt_prob = xt_prob.to(self.device).float()
+        x0hat_prob = x0hat_prob.to(self.device).float()
+        t = t.to(self.device).long()
+        B, L, K = xt_prob.shape
+        assert K == self.K
+        
+        # 邊界檢查：確保 delta 不超過當前步數
+        delta = min(delta, t.min().item())
+        if delta <= 0:
+            return xt_prob
+            
+        # 目標步數 t_target = t - delta
+        t_target = torch.clamp(t - delta, min=0)
+        
+        # 計算多步轉移矩陣積 M_{t:t-Δ+1} 的閉式係數
+        # 對於每個 batch element，計算其對應的轉移矩陣積
+        a_cumulative = torch.ones(B, 1, 1, device=self.device, dtype=torch.float32)  # 累積的對角項係數
+        b_cumulative = torch.zeros(B, 1, 1, device=self.device, dtype=torch.float32)  # 累積的均勻項係數
+        
+        # 對每個可能的步數進行迭代計算
+        for batch_idx in range(B):
+            t_current = t[batch_idx].item()
+            t_end = t_target[batch_idx].item()
+            
+            # 從 t_current 向下到 t_end+1 逐步累積轉移矩陣
+            for step in range(t_current, t_end, -1):
+                if step >= 1 and step <= self.T:
+                    beta_s = self.betas[step - 1]  # step 是 1-indexed
+                    a_s = 1.0 - beta_s  # 對角項係數
+                    b_s = beta_s / self.K  # 均勻項係數
+                    
+                    # 矩陣積更新：M_new = M_s @ M_old
+                    # 新係數計算：
+                    # a_new = a_s * a_old
+                    # b_new = a_s * b_old + b_s * (a_old + K * b_old)
+                    a_old = a_cumulative[batch_idx, 0, 0]
+                    b_old = b_cumulative[batch_idx, 0, 0]
+                    
+                    a_cumulative[batch_idx, 0, 0] = a_s * a_old
+                    b_cumulative[batch_idx, 0, 0] = a_s * b_old + b_s * (a_old + self.K * b_old)
+        
+        # 計算 M_{t-Δ} 的係數（用於 x̂0 項）
+        # 處理邊界情況：當 t_target = 0 時，M_0 = I（即 a=1, b=0）
+        mask_target_zero = (t_target == 0).view(B, 1, 1)  # (B,1,1)
+        
+        a_target = torch.ones(B, 1, 1, device=self.device, dtype=torch.float32)
+        b_target = torch.zeros(B, 1, 1, device=self.device, dtype=torch.float32)
+        
+        # 對於 t_target > 0 的情況，計算對應的 M_{t-Δ} 係數
+        for batch_idx in range(B):
+            t_tgt = t_target[batch_idx].item()
+            if t_tgt > 0 and t_tgt <= self.T:
+                beta_tgt = self.betas[t_tgt - 1]  # t_tgt 是 1-indexed
+                a_target[batch_idx, 0, 0] = 1.0 - beta_tgt
+                b_target[batch_idx, 0, 0] = beta_tgt / self.K
+        
+        # 應用邊界條件：t_target=0 時保持 a=1, b=0
+        a_target = torch.where(mask_target_zero, torch.ones_like(a_target), a_target)
+        b_target = torch.where(mask_target_zero, torch.zeros_like(b_target), b_target)
+        
+        # 計算後驗機率的各個組件
+        ones = torch.ones_like(xt_prob)  # (B,L,K)
+        
+        # A = M_{t:t-Δ+1}^T @ x_t = a_cumulative * x_t + b_cumulative * (1^T @ x_t) * 1
+        sum_xt = xt_prob.sum(dim=-1, keepdim=True)  # (B,L,1)
+        A = a_cumulative * xt_prob + b_cumulative * sum_xt * ones  # (B,L,K)
+        
+        # B = M_{t-Δ} @ x̂0 = a_target * x̂0 + b_target * (1^T @ x̂0) * 1  
+        sum_x0hat = x0hat_prob.sum(dim=-1, keepdim=True)  # (B,L,1)
+        B_term = a_target * x0hat_prob + b_target * sum_x0hat * ones  # (B,L,K)
+        
+        # 分母：x_t^T @ M_{t:t-Δ+1} @ x̂0
+        # = x_t^T @ (a_cumulative * x̂0 + b_cumulative * sum(x̂0) * 1)
+        # = a_cumulative * (x_t · x̂0) + b_cumulative * sum(x̂0) * sum(x_t)
+        dot_xt_x0hat = (xt_prob * x0hat_prob).sum(dim=-1, keepdim=True)  # (B,L,1)
+        denom = a_cumulative * dot_xt_x0hat + b_cumulative * sum_x0hat * sum_xt  # (B,L,1)
+        
+        # 後驗機率：q(x_{t-Δ}|x_t, x̂0) = (A ⊙ B) / denom
+        posterior = (A * B_term) / denom.clamp_min(self.eps)  # (B,L,K)
+        
+        # 歸一化確保機率分佈有效
+        posterior = posterior / posterior.sum(dim=-1, keepdim=True).clamp_min(self.eps)
+        
+        return posterior
 
     @property
     def w_prefix(self):

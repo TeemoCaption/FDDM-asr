@@ -1,0 +1,119 @@
+# FDDM-asr 超參數搜尋配置
+# 基於 fddm_zhTW_base.yaml，專門用於 hyperparameter sweep
+# 使用方式：配合 wandb sweep 或其他超參數搜尋工具
+
+# 繼承基礎配置
+base_config: configs/fddm_zhTW_base.yaml
+
+# ==== Sweep 參數定義 ====
+# 以下參數將被 sweep 工具覆蓋
+
+# === L_fd 相關超參數 ===
+lfd:
+  # lambda_offdiag: 非對角線項懲罰強度
+  # 搜尋範圍：根據 Barlow Twins 經驗和論文建議
+  lambda_offdiag:
+    distribution: log_uniform
+    min: 1.0e-3      # 最小值：1e-3
+    max: 2.0e-2      # 最大值：2e-2
+    # 建議測試點：[1e-3, 2e-3, 5e-3, 1e-2, 2e-2]
+  
+  # n_step_fd: L_fd 併入頻率
+  # 每 n 步計算一次 L_fd，平衡計算成本與訓練效果
+  n_step_fd:
+    distribution: categorical
+    values: [1, 2, 4, 8, 16]
+    # 1: 每步都計算（最穩定但成本高）
+    # 4-8: 平衡選擇
+    # 16: 低頻率更新
+  
+  # tau: L_fd 總體縮放係數
+  # 控制 L_fd 相對於 L_cvb 的權重
+  tau:
+    distribution: log_uniform
+    min: 0.1
+    max: 5.0
+    # 建議測試點：[0.1, 0.5, 1.0, 2.0, 5.0]
+
+# === 優化器相關超參數 ===
+optim:
+  # 學習率搜尋
+  lr:
+    distribution: log_uniform
+    min: 1.0e-4      # 最小學習率
+    max: 1.0e-3      # 最大學習率
+    # 建議測試點：[1e-4, 2e-4, 5e-4, 1e-3]
+  
+  # 批次大小（根據顯存限制調整）
+  batch_size:
+    distribution: categorical
+    values: [2, 4, 8, 16]
+    # 注意：較大 batch_size 需要更多顯存
+  
+  # 權重衰減
+  weight_decay:
+    distribution: log_uniform
+    min: 1.0e-3
+    max: 1.0e-1
+    # 建議測試點：[1e-3, 5e-3, 1e-2, 5e-2, 1e-1]
+
+# === 模型架構相關 ===
+model:
+  # Dropout 比率
+  dropout:
+    distribution: uniform
+    min: 0.05
+    max: 0.2
+    # 建議測試點：[0.05, 0.1, 0.15, 0.2]
+  
+  # 投影維度
+  projector:
+    d_proj:
+      distribution: categorical
+      values: [128, 256, 512, 768]
+      # 較小維度：計算快但表達能力有限
+      # 較大維度：表達能力強但計算成本高
+
+# === 擴散相關超參數 ===
+diffusion:
+  # 最大噪聲強度
+  beta_max:
+    distribution: uniform
+    min: 0.1
+    max: 0.3
+    # 建議測試點：[0.1, 0.15, 0.2, 0.25, 0.3]
+
+# ==== Sweep 策略建議 ====
+# 
+# 階段 1：粗略搜尋（Grid Search）
+# - 重點參數：lambda_offdiag, n_step_fd, lr
+# - 固定其他參數為預設值
+# - 目標：找到大致的最佳區間
+#
+# 階段 2：精細搜尋（Random/Bayesian Search）
+# - 在階段 1 的最佳區間內進行更精細搜尋
+# - 加入更多參數：tau, dropout, d_proj
+# - 目標：找到最佳參數組合
+#
+# 階段 3：驗證與消融（Ablation Study）
+# - 固定最佳參數，單獨測試每個參數的影響
+# - 驗證 L_fd 的有效性（關閉 L_fd 對比）
+# - 目標：理解各參數的作用機制
+
+# ==== 評估指標 ====
+# 主要指標：
+# - WER (Word Error Rate) / CER (Character Error Rate)
+# - 訓練穩定性（loss 收斂速度）
+# - L_fd 對角線/非對角線項數值
+#
+# 次要指標：
+# - 推理速度
+# - 模型大小
+# - 記憶體使用量
+
+# ==== 早停策略 ====
+# 建議設定：
+# - 監控驗證集 WER/CER
+# - patience: 5-10 epochs
+# - min_delta: 0.001
+# - 避免過度訓練浪費計算資源

@@ -61,35 +61,60 @@ class AcousticEncoder(nn.Module):
     @torch.no_grad()
     def _make_mask(self, lengths: torch.Tensor, max_len: int) -> torch.Tensor:
         """建立時間軸 mask（True 表示有效位置）。
-        lengths: [B] 單位=樣本點 or WavLM frame 數，這裡對齊 WavLM 輸出長度使用。
+        lengths: [B] WavLM frame 數（已經轉換後的長度）
+        max_len: 最大 frame 數（通常是 batch 中的 S）
         """
         device = lengths.device
         # [B, S]，每列 0..len-1 為 True
-        ids = torch.arange(max_len, device=device).unsqueeze(0)
-        mask = ids < lengths.unsqueeze(1)
+        ids = torch.arange(max_len, device=device).unsqueeze(0)  # [1, S]
+        mask = ids < lengths.unsqueeze(1)  # [B, 1] < [1, S] -> [B, S]
         return mask
+    
+    def _compute_wavlm_frame_length(self, waveform_length: torch.Tensor) -> torch.Tensor:
+        """計算 WavLM 輸出的 frame 數量。
+        WavLM-large 使用 320 點 hop_length，但實際上可能有微調。
+        這裡使用保守的估算方式。
+        """
+        # WavLM 的下採樣比率約為 320 (根據 transformers 實現)
+        # 但為了穩定性，我們使用保守估算
+        hop_length = 320
+        frame_length = (waveform_length + hop_length - 1) // hop_length  # 向上取整
+        return frame_length
 
     def forward(
         self,
         waveforms: torch.Tensor,                # [B, T]，16kHz raw waveform
         lengths: Optional[torch.Tensor] = None, # [B]，實際長度（樣本點數），可選
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        # WavLM forward，取得 last hidden states: [B, S, hidden]
-        # transformers 的 WavLM 會自動做 framing + 特徵抽取
-        out = self.backbone(waveforms, output_hidden_states=False)
+        B, T = waveforms.shape
+        device = waveforms.device
+        
+        # 建立 waveform 的 attention_mask 給 WavLM backbone
+        attention_mask = None
+        if lengths is not None:
+            # 建立 waveform 層級的 attention_mask
+            attention_mask = self._make_mask(lengths, T)  # [B, T]
+        
+        # WavLM forward，傳入 attention_mask 確保 padding 區域不被處理
+        out = self.backbone(
+            waveforms, 
+            attention_mask=attention_mask,  # 關鍵修正：傳入 mask
+            output_hidden_states=False
+        )
         feats = out.last_hidden_state  # [B, S, hidden]
 
-        # 投影到 d_model
+        # 投射到 d_model
         feats = self.proj(feats)       # [B, S, d_model]
 
-        # 建立 mask（如果給了 lengths）
+        # 建立特徵層級的 mask（如果給了 lengths）
         feat_mask = None
         if lengths is not None:
-            # 估計 WavLM 下游時間步 S（粗略按照 backbone 的下採樣比率推斷）
-            # 若 lengths 為樣本點數，WavLM-large 約 320 hop；這裡用實際輸出長度對齊更穩妥。
             B, S, _ = feats.shape
-            feat_lengths = torch.full((feats.size(0),), S, device=feats.device)
-            feat_mask = self._make_mask(feat_lengths, S)  # 全 True（若無法精確對齊可先這樣）
+            # 正確計算每個樣本的 WavLM frame 數量
+            feat_lengths = self._compute_wavlm_frame_length(lengths)  # [B]
+            # 確保不超過實際輸出長度
+            feat_lengths = torch.clamp(feat_lengths, max=S)
+            feat_mask = self._make_mask(feat_lengths, S)  # [B, S] 正確的 mask
 
         pooled = None
         if self.pooling == "mean":

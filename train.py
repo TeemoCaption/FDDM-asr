@@ -42,6 +42,21 @@ from models.denoise_decoder import DenoisingTransformerDecoder
 from models.projection import SpeechProjector, TextEmbedding, TextProjector
 from losses.fddm_losses import lfd_loss
 
+# ====== 重要提醒：Tokenizer 特殊 Token 對應 ======
+# 在導入真實資料時，請確保以下 token 與 tokenizer 設定一致：
+# - pad_id: padding token ID（通常為 0）
+# - bos_id: beginning of sequence token ID（如果使用）
+# - eos_id: end of sequence token ID（如果使用）
+# - unk_id: unknown token ID（處理 OOV 詞彙）
+# 
+# 範例配置檔設定：
+# data:
+#   pad_id: 0      # <pad> token
+#   bos_id: 1      # <bos> token（可選）
+#   eos_id: 2      # <eos> token（可選）
+#   unk_id: 3      # <unk> token
+#   vocab_size: 8000  # 包含特殊 token 的總詞彙量
+
 # === 匯入 Scheduler（依實際路徑修正） ===
 _SCHED_IMPORT_OK = False
 try:
@@ -99,8 +114,9 @@ class SchedulerAdapter:
         xt_prob = self.sch.q_sample(x0_onehot, t)  # 呼叫實際的方法名稱
         # 從機率分佈採樣回離散 token
         return torch.multinomial(xt_prob.view(-1, vocab_size), 1).view(B, L)
-    def kl_term(self, xt: torch.Tensor, x0: torch.Tensor, logits_x0: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def kl_term(self, xt: torch.Tensor, x0: torch.Tensor, logits_x0: torch.Tensor, t: torch.Tensor, x_mask: torch.Tensor = None) -> torch.Tensor:
         # 計算 KL divergence: KL[q(xt-1|xt,x0) || p_theta(xt-1|xt,c)]
+        # 改進維度聚合：先對 token 維做均值，再對 batch 做均值
         B, L, V = logits_x0.shape
         
         # 轉換為 one-hot 格式
@@ -119,9 +135,20 @@ class SchedulerAdapter:
         # 計算預測後驗 p_theta(xt-1|xt,c) ≈ q(xt-1|xt,x0hat)
         p_posterior = self.sch.q_posterior(xt_onehot, x0hat_prob, t)
         
-        # KL divergence
-        kl = torch.sum(q_posterior * torch.log((q_posterior + 1e-8) / (p_posterior + 1e-8)), dim=-1)
-        return kl.mean()  # 回傳 batch 平均
+        # KL divergence，改進數值穩定性
+        eps = 1e-8
+        kl_per_token = torch.sum(q_posterior * torch.log((q_posterior + eps) / (p_posterior + eps)), dim=-1)  # [B, L]
+        
+        # 精細的維度聚合：考慮 mask 的影響
+        if x_mask is not None:
+            # 只對有效 token 計算平均
+            kl_per_sample = (kl_per_token * x_mask.float()).sum(dim=1) / (x_mask.sum(dim=1).float() + eps)  # [B]
+        else:
+            # 對所有 token 位置取均值
+            kl_per_sample = kl_per_token.mean(dim=1)  # [B]
+        
+        # 對 batch 取均值
+        return kl_per_sample.mean()  # scalar
     def w_t(self, t: torch.Tensor) -> torch.Tensor:
         # 使用 scheduler 的 alpha_bar (即 w_prefix) 屬性
         if hasattr(self.sch, 'alpha_bar'):
@@ -181,32 +208,49 @@ def train_one_epoch(
         xt = scheduler.sample_q(x0, t)     # [B, L]
 
         # 解碼器 f_theta(xt, t, c) -> logits 對 x_0 的分佈
-        logits = decoder(xt, t, c, x_mask=(x0!=pad_id), c_mask=None)  # [B, L, V]
+        # 注意：x_mask 排除 padding token，確保模型不學習預測 padding
+        logits = decoder(xt, t, c, x_mask=(x0!=pad_id), c_mask=c_mask)  # [B, L, V]
 
+        # 建立 token mask（排除 padding）
+        x_mask = (x0 != pad_id)  # [B, L] True=有效 token
+        
         # Diffusion KL（論文 Eq.(6)）
-        loss_diff = scheduler.kl_term(xt, x0, logits, t)  # scalar（或 [B] 再取均值）
-        if hasattr(loss_diff, 'dim') and loss_diff.dim() > 0:
-            loss_diff = loss_diff.mean()
-
+        loss_diff = scheduler.kl_term(xt, x0, logits, t, x_mask)  # 傳入 mask 進行精確計算
+        
+        # 初始化總損失
         loss = loss_diff
-
+        loss_fd_value = 0.0  # 用於日誌記錄
+        
         # 每 n_step_fd 次加入 L_fd（論文 3.3）
         n_step_fd = cfg.lfd['n_step_fd']
-        if (global_step % n_step_fd) == 0:
+        apply_lfd = (global_step % n_step_fd) == 0
+        
+        if apply_lfd:
             lambda_off = cfg.lfd['lambda_offdiag']
             tau = cfg.lfd.get('tau', 1.0)
-            with torch.no_grad():
-                z_text = t_proj(t_embed(logits))  # [B, L, d_proj]
-                z_speech = s_proj(c)             # [B, S, d_proj]
-                S = z_speech.size(1)
-                if S >= L:
-                    z_speech_aligned = z_speech[:, :L, :]
-                else:
-                    pad = z_speech[:, -1:, :].repeat(1, L - S, 1)
-                    z_speech_aligned = torch.cat([z_speech, pad], dim=1)
-                w_t = scheduler.w_t(t).mean()  # 做 batch 平均
-                loss_fd = lfd_loss(z_speech_aligned, z_text, lambda_offdiag=lambda_off)
-                loss = loss + tau * w_t * loss_fd
+            
+            # 計算跨模態特徵投影
+            z_text = t_proj(t_embed(logits))  # [B, L, d_proj]
+            z_speech = s_proj(c)             # [B, S, d_proj]
+            
+            # 對齊序列長度（語音特徵通常比文字長）
+            S = z_speech.size(1)
+            if S >= L:
+                z_speech_aligned = z_speech[:, :L, :]  # 截取前 L 個時間步
+            else:
+                # 重複最後一個時間步來補齊
+                pad = z_speech[:, -1:, :].repeat(1, L - S, 1)
+                z_speech_aligned = torch.cat([z_speech, pad], dim=1)
+            
+            # 計算權重 w_t = ∏_{s=1}^t (1-β_s)
+            w_t = scheduler.w_t(t).mean()  # 對 batch 取平均
+            
+            # 計算 L_fd 損失
+            loss_fd = lfd_loss(z_speech_aligned, z_text, lambda_offdiag=lambda_off)
+            loss_fd_value = float(loss_fd)  # 記錄數值用於日誌
+            
+            # 加入總損失
+            loss = loss + tau * w_t * loss_fd
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -214,7 +258,11 @@ def train_one_epoch(
         optimizer.step()
 
         if (global_step % log_every) == 0:
-            print(f"step={global_step} loss_diff={float(loss_diff):.4f} total_loss={float(loss):.4f}")
+            log_msg = f"step={global_step} loss_diff={float(loss_diff):.4f}"
+            if apply_lfd:
+                log_msg += f" loss_fd={loss_fd_value:.4f} w_t={float(w_t):.4f}"
+            log_msg += f" total_loss={float(loss):.4f}"
+            print(log_msg)
         global_step += 1
 
     return global_step
