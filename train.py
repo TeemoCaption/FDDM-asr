@@ -210,11 +210,13 @@ def logits_to_text(logits: torch.Tensor, tokenizer, pad_id: int, bos_id: int = N
         text = ''
     
     return text
+@dataclass
 class Config:
     seed: int
     data: dict
     model: dict
     diffusion: dict
+    inference: dict  # 添加 inference 字段
     optim: dict
     lfd: dict
     log: dict
@@ -471,6 +473,7 @@ def evaluate_train_cer(
     return avg_cer
 
 def main():
+    parser = argparse.ArgumentParser(description="FDDM-ASR Training Script")
     parser.add_argument('--config', type=str, required=True)
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     args = parser.parse_args()
