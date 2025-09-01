@@ -558,9 +558,8 @@ def main():
         
         # 每個 epoch 結束後進行驗證
         if val_loader is not None:
-            val_cer = evaluate_cer(
-                encoder, decoder, s_proj, t_embed, t_proj,
-                scheduler, val_loader, device, cfg, tokenizer
+            val_cer = evaluate_cer_with_jumpy_sampling(
+                encoder, decoder, scheduler, val_loader, device, cfg, tokenizer
             )
             # 計算驗證損失
             val_loss = evaluate_validation_loss(
@@ -592,9 +591,8 @@ def main():
         
         # 每個 epoch 結束後進行測試
         if test_loader is not None:
-            test_cer = evaluate_cer(
-                encoder, decoder, s_proj, t_embed, t_proj,
-                scheduler, test_loader, device, cfg, tokenizer
+            test_cer = evaluate_cer_with_jumpy_sampling(
+                encoder, decoder, scheduler, test_loader, device, cfg, tokenizer
             )
             print(f"Epoch {epoch} Test CER: {test_cer:.4f}")
         

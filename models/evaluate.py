@@ -98,6 +98,76 @@ def calculate_cer(ref: str, hyp: str) -> float:
         return 0.0 if len(h) == 0 else 1.0
     return float(dp[len(r), len(h)]) / float(len(r))
 
+def calculate_wer(ref: str, hyp: str) -> float:
+    """
+    基本 WER：對 ref/hyp 做空白切詞，計算詞級 Levenshtein / 參考詞數。
+    """
+    import numpy as np
+    r = ref.strip().split()
+    h = hyp.strip().split()
+    dp = np.zeros((len(r)+1, len(h)+1), dtype=np.int32)
+    for i in range(len(r)+1): dp[i, 0] = i
+    for j in range(len(h)+1): dp[0, j] = j
+    for i in range(1, len(r)+1):
+        for j in range(1, len(h)+1):
+            cost = 0 if r[i-1] == h[j-1] else 1
+            dp[i, j] = min(dp[i-1, j] + 1, dp[i, j-1] + 1, dp[i-1, j-1] + cost)
+    return 0.0 if len(r) == 0 else float(dp[len(r), len(h)]) / float(len(r))
+
+@torch.no_grad()
+def evaluate_wer_with_jumpy_sampling(
+    encoder, decoder, scheduler, data_loader, device, cfg, tokenizer
+) -> float:
+    # 載入與 evaluate_cer_with_jumpy_sampling 相同的 sampling_config，
+    # 但一定要保證 posterior_mode='map'
+    sampling_config = {
+        'T_infer': cfg.get('inference', {}).get('T_infer', 20),
+        'r': cfg.get('inference', {}).get('r', 5),
+        'greedy': True,
+        'posterior_mode': 'map',
+        'sampling_mode': cfg.get('inference', {}).get('sampling_mode', 'exact'),
+        'temperature': cfg.get('inference', {}).get('temperature', 1.0),
+    }
+    from sampler.jumpy_sampler import DiffusionJumpySampler
+
+    encoder.eval(); decoder.eval()
+    pad_id = cfg.data['pad_id']; vocab_size = cfg.data['vocab_size']
+    T_train = cfg.diffusion['T']
+
+    total_wer, total_samples = 0.0, 0
+    for batch in data_loader:
+        wave, x0 = batch
+        wave = wave.to(device)
+        B, L = x0.shape
+        c, c_mask, _ = encoder(wave)
+
+        hyps = []
+        for b in range(B):
+            sampler = DiffusionJumpySampler(
+                scheduler=scheduler.sch if hasattr(scheduler, 'sch') else scheduler,
+                decoder=decoder, K=vocab_size, T_train=T_train,
+                T_infer=sampling_config['T_infer'], r=sampling_config['r'],
+                greedy=True, posterior_mode='map',
+                sampling_mode=sampling_config['sampling_mode'],
+                temperature=sampling_config['temperature'],
+                device=device,
+            )
+            x_pred, _ = sampler.sample(cond_c=c[b:b+1], seq_len=L)  # [1, L]
+            hyp = _ids_to_text_one(
+                x_pred[0], tokenizer, pad_id, cfg.data.get('bos_id'), cfg.data.get('eos_id')
+            )
+            hyps.append(hyp)
+
+        refs = [
+            _ids_to_text_one(x0[i], tokenizer, pad_id, cfg.data.get('bos_id'), cfg.data.get('eos_id'))
+            for i in range(B)
+        ]
+        for ref, hyp in zip(refs, hyps):
+            total_wer += calculate_wer(ref, hyp)
+            total_samples += 1
+
+    return (total_wer / total_samples) if total_samples > 0 else 0.0
+
 @torch.no_grad()
 def evaluate_train_cer(
     encoder,
