@@ -35,11 +35,13 @@ from dataclasses import dataclass
 
 import torch
 from torch.utils.data import Dataset, DataLoader
+from torch import amp  # 提供 amp.GradScaler 與 amp.autocast（跨裝置統一接口）
 
 # ====== 匯入本專案模組 ======
 from models.acoustic_encoder import AcousticEncoder
 from models.denoise_decoder import DenoisingTransformerDecoder
 from models.projection import SpeechProjector, TextEmbedding, TextProjector
+from models.evaluate import calculate_cer, logits_to_text, evaluate_train_cer, evaluate_cer  # 匯入評估函數
 from losses.fddm_losses import lfd_loss
 
 # ====== 重要提醒：Tokenizer 特殊 Token 對應 ======
@@ -93,6 +95,10 @@ class CVZhTWDataset(Dataset):
         self.tokenizer = spm.SentencePieceProcessor()
         self.tokenizer.load(tokenizer_vocab_path)
         
+        # 計算最大音頻長度（從配置中讀取，或使用預設值）
+        # max_seconds 通常在配置中設定，預設為 20 秒
+        self.max_audio_samples = 20 * 16000  # 預設 20 秒 * 16kHz
+        
         # 過濾有效樣本（有音頻檔案的）
         self.valid_indices = []
         for i, item in enumerate(self.data):
@@ -115,6 +121,15 @@ class CVZhTWDataset(Dataset):
         wav, sr = librosa.load(item['processed_path'], sr=16000)
         wav = torch.tensor(wav, dtype=torch.float32)
         
+        # 確保音頻長度一致：截斷或填充到固定長度
+        if len(wav) > self.max_audio_samples:
+            # 截斷過長的音頻
+            wav = wav[:self.max_audio_samples]
+        elif len(wav) < self.max_audio_samples:
+            # 填充過短的音頻（用零填充）
+            padding = torch.zeros(self.max_audio_samples - len(wav))
+            wav = torch.cat([wav, padding], dim=0)
+        
         # 處理文本
         text = item['normalized_sentence']
         tokens = self.tokenizer.encode(text)
@@ -133,83 +148,10 @@ class CVZhTWDataset(Dataset):
         
         x0 = torch.tensor(tokens, dtype=torch.long)
         
+        return wav, x0
+        
 # ============ CER 評估指標實作 ============
-# CER (Character Error Rate) 計算函數
-# 計算字元錯誤率：(插入 + 刪除 + 替換) / 總字元數
-def calculate_cer(pred_text: str, target_text: str) -> float:
-    # 移除空白和標點符號，轉小寫進行比較
-    import re
-    
-    # 簡化文字預處理：移除空白
-    pred_text = pred_text.replace(' ', '')
-    target_text = target_text.replace(' ', '')
-    
-    # 計算編輯距離
-    def levenshtein_distance(s1: str, s2: str) -> int:
-        # 使用動態規劃計算最小編輯距離
-        m, n = len(s1), len(s2)
-        dp = [[0] * (n + 1) for _ in range(m + 1)]
-        
-        # 初始化第一行和第一列
-        for i in range(m + 1):
-            dp[i][0] = i  # 刪除操作
-        for j in range(n + 1):
-            dp[0][j] = j  # 插入操作
-        
-        # 填充 dp 表格
-        for i in range(1, m + 1):
-            for j in range(1, n + 1):
-                if s1[i - 1] == s2[j - 1]:
-                    dp[i][j] = dp[i - 1][j - 1]  # 字符相同，無需操作
-                else:
-                    dp[i][j] = min(
-                        dp[i - 1][j] + 1,     # 刪除
-                        dp[i][j - 1] + 1,     # 插入
-                        dp[i - 1][j - 1] + 1  # 替換
-                    )
-        
-        return dp[m][n]
-    
-    # 計算編輯距離
-    edit_distance = levenshtein_distance(pred_text, target_text)
-    
-    # 計算 CER：編輯距離 / 真實文字長度
-    if len(target_text) == 0:
-        return 0.0 if len(pred_text) == 0 else 1.0
-    
-    cer = edit_distance / len(target_text)
-    return cer
-
-# 從 logits 轉換為預測文字的輔助函數
-def logits_to_text(logits: torch.Tensor, tokenizer, pad_id: int, bos_id: int = None, eos_id: int = None) -> str:
-    # logits: [L, V] 或 [B, L, V]，這裡假設 [L, V]
-    if logits.dim() == 3:
-        # 如果是 batch，取第一個樣本
-        logits = logits[0]  # [L, V]
-    
-    # 取得預測的 token IDs（取 argmax）
-    pred_ids = torch.argmax(logits, dim=-1).cpu().numpy()  # [L]
-    
-    # 移除 padding token
-    valid_ids = []
-    for token_id in pred_ids:
-        if token_id == pad_id:
-            break
-        valid_ids.append(token_id)
-    
-    # 移除 bos 和 eos token（如果存在）
-    if bos_id is not None and valid_ids and valid_ids[0] == bos_id:
-        valid_ids = valid_ids[1:]
-    if eos_id is not None and valid_ids and valid_ids[-1] == eos_id:
-        valid_ids = valid_ids[:-1]
-    
-    # 將 token IDs 轉換為文字
-    if valid_ids:
-        text = tokenizer.decode(valid_ids)
-    else:
-        text = ''
-    
-    return text
+# CER 評估相關函數已移至 models/evaluate.py
 @dataclass
 class Config:
     seed: int
@@ -235,40 +177,81 @@ class SchedulerAdapter:
         # 從機率分佈採樣回離散 token
         return torch.multinomial(xt_prob.view(-1, vocab_size), 1).view(B, L)
     def kl_term(self, xt: torch.Tensor, x0: torch.Tensor, logits_x0: torch.Tensor, t: torch.Tensor, x_mask: torch.Tensor = None) -> torch.Tensor:
-        # 計算 KL divergence: KL[q(xt-1|xt,x0) || p_theta(xt-1|xt,c)]
-        # 改進維度聚合：先對 token 維做均值，再對 batch 做均值
+        """
+        可微分版本的 KL[q(xt-1|xt,x0) || p_theta(xt-1|xt,c)]。
+        參數：
+            xt:         [B, L]，第 t 步的離散樣本（整數 id）
+            x0:         [B, L]，真實目標（整數 id）
+            logits_x0:  [B, L, V]，模型對 x_0 的類別 logits（可微）
+            t:          [B]，每個樣本對應的時間步（1..T）
+            x_mask:     [B, L]，True 表有效 token（避免 pad 影響）
+        回傳：
+            樣本/序列聚合後的 scalar（需梯度）
+        """
         B, L, V = logits_x0.shape
-        
-        # 轉換為 one-hot 格式
-        xt_onehot = torch.zeros(B, L, V, device=xt.device)
-        xt_onehot.scatter_(-1, xt.unsqueeze(-1), 1.0)
-        
-        x0_onehot = torch.zeros(B, L, V, device=x0.device)
-        x0_onehot.scatter_(-1, x0.unsqueeze(-1), 1.0)
-        
-        # 從 logits 得到預測的 x0 機率分佈
-        x0hat_prob = torch.softmax(logits_x0, dim=-1)
-        
-        # 計算真實後驗 q(xt-1|xt,x0)
-        q_posterior = self.sch.q_posterior(xt_onehot, x0_onehot, t)
-        
-        # 計算預測後驗 p_theta(xt-1|xt,c) ≈ q(xt-1|xt,x0hat)
-        p_posterior = self.sch.q_posterior(xt_onehot, x0hat_prob, t)
-        
-        # KL divergence，改進數值穩定性
-        eps = 1e-8
-        kl_per_token = torch.sum(q_posterior * torch.log((q_posterior + eps) / (p_posterior + eps)), dim=-1)  # [B, L]
-        
-        # 精細的維度聚合：考慮 mask 的影響
+        device = logits_x0.device
+        dtype = logits_x0.dtype  # 用 float32/float16 皆可
+
+        # 將 logits 轉機率（保留梯度）
+        x0_hat = torch.softmax(logits_x0, dim=-1)                 # [B, L, V], requires_grad=True
+
+        # one-hot（不需要梯度，但不會阻斷 x0_hat 的梯度）
+        xt_onehot = torch.zeros(B, L, V, device=device, dtype=dtype)
+        xt_onehot.scatter_(-1, xt.unsqueeze(-1), 1.0)             # [B, L, V]
+        x0_onehot = torch.zeros(B, L, V, device=device, dtype=dtype)
+        x0_onehot.scatter_(-1, x0.unsqueeze(-1), 1.0)             # [B, L, V]
+
+        # 取 betas_t 與 betas_{t-1}（t=1 時視作 beta_{0}=0 ⇒ M_0 為單位轉移）
+        if not hasattr(self.sch, 'betas'):
+            raise ValueError("Scheduler 需提供 self.betas (shape [T]) 才能計算 posterior。")
+        betas = self.sch.betas.to(device)                         # [T]
+
+        beta_t_vec = betas[t - 1]                                 # [B]
+        prev_idx = (t - 2).clamp(min=0)                           # [B]；t=1 時先指向 0
+        beta_prev_vec = betas[prev_idx]                           # [B]
+        beta_prev_vec = torch.where(t.eq(1),                      # t=1 強制設為 0
+                                    torch.zeros_like(beta_prev_vec),
+                                    beta_prev_vec)
+
+        # 方便 broadcast 用的 shape
+        beta_t     = beta_t_vec.view(B, 1, 1)                     # [B,1,1]
+        beta_prev  = beta_prev_vec.view(B, 1, 1)                  # [B,1,1]
+        one        = torch.ones_like(x0_hat)                      # [B, L, V]
+        eps        = 1e-8
+        K          = float(V)
+
+        # M_t^T x_t = (β_t/K)*1 + (1-β_t)*x_t
+        MtT_xt = (beta_t / K) * one + (1.0 - beta_t) * xt_onehot  # [B, L, V]
+
+        # M_{t-1} x ；"真實"用 x0 的 one-hot，"模型"用 x0_hat 的機率
+        Mprev_x0    = (1.0 - beta_prev) * x0_onehot + (beta_prev / K) * one   # [B, L, V]
+        Mprev_x0hat = (1.0 - beta_prev) * x0_hat    + (beta_prev / K) * one   # [B, L, V] requires_grad
+
+        # 分母 x_t^T M_t x
+        # 真實：x = x0（one-hot）；模型：x = x0_hat（softmax 機率）
+        # gather：取出 x 在 xt 所指類別的值，shape [B,L]
+        x0_at_xt    = torch.sum(x0_onehot * xt_onehot, dim=-1)                      # [B, L], {0,1}
+        x0hat_at_xt = torch.gather(x0_hat, dim=-1, index=xt.unsqueeze(-1)).squeeze(-1)  # [B, L]
+
+        beta_t_scalar = beta_t_vec.unsqueeze(-1)                                     # [B, 1]
+        denom_true = (beta_t_scalar / K) + (1.0 - beta_t_scalar) * x0_at_xt          # [B, L]
+        denom_pred = (beta_t_scalar / K) + (1.0 - beta_t_scalar) * x0hat_at_xt       # [B, L]
+
+        # posterior：按元素相乘後除以分母（對每個 token 正規化）
+        q_post = (MtT_xt * Mprev_x0)    / (denom_true.unsqueeze(-1) + eps)           # [B, L, V]
+        p_post = (MtT_xt * Mprev_x0hat) / (denom_pred.unsqueeze(-1) + eps)           # [B, L, V], requires_grad
+
+        # KL per token：sum_k q * log(q/p)
+        kl_token = torch.sum(q_post * (torch.log(q_post + eps) - torch.log(p_post + eps)), dim=-1)  # [B, L]
+
+        # 掩碼有效 token 再做平均
         if x_mask is not None:
-            # 只對有效 token 計算平均
-            kl_per_sample = (kl_per_token * x_mask.float()).sum(dim=1) / (x_mask.sum(dim=1).float() + eps)  # [B]
+            valid = x_mask.float()                                                   # [B, L]
+            kl_per_sample = (kl_token * valid).sum(dim=1) / (valid.sum(dim=1) + eps) # [B]
         else:
-            # 對所有 token 位置取均值
-            kl_per_sample = kl_per_token.mean(dim=1)  # [B]
-        
-        # 對 batch 取均值
-        return kl_per_sample.mean()  # scalar
+            kl_per_sample = kl_token.mean(dim=1)
+
+        return kl_per_sample.mean()
     def w_t(self, t: torch.Tensor) -> torch.Tensor:
         # 使用 scheduler 的 alpha_bar (即 w_prefix) 屬性
         if hasattr(self.sch, 'alpha_bar'):
@@ -301,6 +284,7 @@ def train_one_epoch(
     device: torch.device,
     cfg: Config,
     global_step: int,
+    scaler: GradScaler = None,  # 添加 AMP scaler 參數
 ) -> int:
     encoder.eval()   # 預設凍結
     decoder.train()
@@ -318,7 +302,8 @@ def train_one_epoch(
         B, L = x0.shape
 
         # 取聲學條件 c = c_psi(s)
-        with torch.no_grad():
+        # 注意：即使編碼器被凍結，我們仍然需要它的輸出來計算梯度
+        with amp.autocast('cuda'):  # AMP: 混合精度前向傳播
             c, c_mask, _ = encoder(wave)   # [B, S, d]
 
         # 抽樣時間步 t ~ U[1, T]
@@ -329,7 +314,8 @@ def train_one_epoch(
 
         # 解碼器 f_theta(xt, t, c) -> logits 對 x_0 的分佈
         # 注意：x_mask 排除 padding token，確保模型不學習預測 padding
-        logits = decoder(xt, t, c, x_mask=(x0!=pad_id), c_mask=c_mask)  # [B, L, V]
+        with amp.autocast('cuda'):  # AMP: 混合精度前向傳播
+            logits = decoder(xt, t, c, x_mask=(x0!=pad_id), c_mask=c_mask)  # [B, L, V]
 
         # 建立 token mask（排除 padding）
         x_mask = (x0 != pad_id)  # [B, L] True=有效 token
@@ -350,8 +336,9 @@ def train_one_epoch(
             tau = cfg.lfd.get('tau', 1.0)
             
             # 計算跨模態特徵投影
-            z_text = t_proj(t_embed(logits))  # [B, L, d_proj]
-            z_speech = s_proj(c)             # [B, S, d_proj]
+            with amp.autocast('cuda'):  # AMP: 混合精度前向傳播
+                z_text = t_proj(t_embed(logits))  # [B, L, d_proj]
+                z_speech = s_proj(c)             # [B, S, d_proj]
             
             # 對齊序列長度（語音特徵通常比文字長）
             S = z_speech.size(1)
@@ -367,110 +354,59 @@ def train_one_epoch(
             
             # 計算 L_fd 損失
             loss_fd = lfd_loss(z_speech_aligned, z_text, lambda_offdiag=lambda_off)
-            loss_fd_value = float(loss_fd)  # 記錄數值用於日誌
+            loss_fd_value = loss_fd.detach().item()  # 記錄數值用於日誌
             
             # 加入總損失
             loss = loss + tau * w_t * loss_fd
 
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(decoder.parameters(), 5.0)
-        optimizer.step()
+        
+        # AMP: 使用 GradScaler 進行反向傳播
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            
+            # 擴展梯度裁剪範圍：包含所有可訓練模型參數
+            # 避免梯度爆炸，提升訓練穩定性
+            all_trainable_params = (
+                list(decoder.parameters()) +
+                list(s_proj.parameters()) +
+                list(t_embed.parameters()) +
+                list(t_proj.parameters())
+            )
+            scaler.unscale_(optimizer)  # 取消縮放以進行梯度裁剪
+            torch.nn.utils.clip_grad_norm_(all_trainable_params, 5.0)
+            
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            # 非 AMP 模式：傳統反向傳播
+            loss.backward()
+            
+            # 擴展梯度裁剪範圍：包含所有可訓練模型參數
+            # 避免梯度爆炸，提升訓練穩定性
+            all_trainable_params = (
+                list(decoder.parameters()) +
+                list(s_proj.parameters()) +
+                list(t_embed.parameters()) +
+                list(t_proj.parameters())
+            )
+            torch.nn.utils.clip_grad_norm_(all_trainable_params, 5.0)
+            
+            optimizer.step()
 
         if (global_step % log_every) == 0:
-            log_msg = f"step={global_step} loss_diff={float(loss_diff):.4f}"
+            loss_diff_value  = loss_diff.detach().item()
+            total_loss_value = loss.detach().item()
+            log_msg = f"step={global_step} loss_diff={loss_diff_value:.4f}"
             if apply_lfd:
-                log_msg += f" loss_fd={loss_fd_value:.4f} w_t={float(w_t):.4f}"
-            log_msg += f" total_loss={float(loss):.4f}"
+                log_msg += f" loss_fd={loss_fd_value:.4f} w_t={float(w_t):.4f}"  # w_t 通常不需要梯度
+            log_msg += f" total_loss={total_loss_value:.4f}"
             print(log_msg)
         global_step += 1
+    return global_step
 
 # ============ 訓練 CER 計算函數 ============
-def evaluate_train_cer(
-    encoder: AcousticEncoder,
-    decoder: DenoisingTransformerDecoder,
-    s_proj: SpeechProjector,
-    t_embed: TextEmbedding,
-    t_proj: TextProjector,
-    scheduler: SchedulerAdapter,
-    train_loader: DataLoader,
-    device: torch.device,
-    cfg: Config,
-    tokenizer,
-    max_batches: int = 5  # 只計算前 max_batches 個 batch 來節省時間
-) -> float:
-    # 設定模型為評估模式
-    encoder.eval()
-    decoder.eval()
-    s_proj.eval()
-    t_embed.eval()
-    t_proj.eval()
-    
-    pad_id = cfg.data['pad_id']
-    total_cer = 0.0  # 累計 CER
-    total_samples = 0   # 總樣本數
-    
-    with torch.no_grad():
-        for batch_idx, (wave, x0) in enumerate(train_loader, start=1):
-            if batch_idx > max_batches:
-                break  # 只計算前幾個 batch
-            
-            wave = wave.to(device)
-            x0 = x0.to(device)
-            B, L = x0.shape
-            
-            # 取聲學條件 c = c_psi(s)
-            c, c_mask, _ = encoder(wave)  # [B, S, d]
-            
-            # 在評估時，使用 t=1（最小的雜訊）進行推理
-            t = torch.ones(B, dtype=torch.long, device=device)  # [B]
-            
-            # 對於評估，我們使用 x0 作為 xt（無雜訊輸入）
-            xt = x0.clone()  # [B, L]
-            
-            # 解碼器推理：f_theta(xt, t, c) -> logits 對 x_0 的分佈
-            logits = decoder(xt, t, c, x_mask=(x0!=pad_id), c_mask=c_mask)  # [B, L, V]
-            
-            # 對每個樣本計算 CER
-            for b in range(B):
-                # 取得預測文字
-                pred_logits = logits[b]  # [L, V]
-                pred_text = logits_to_text(
-                    pred_logits, 
-                    tokenizer, 
-                    pad_id=pad_id, 
-                    bos_id=cfg.data.get('bos_id'), 
-                    eos_id=cfg.data.get('eos_id')
-                )
-                
-                # 取得真實文字（從 x0 還原）
-                target_ids = x0[b].cpu().numpy()  # [L]
-                valid_target_ids = []
-                for token_id in target_ids:
-                    if token_id == pad_id:
-                        break
-                    valid_target_ids.append(token_id)
-                
-                # 移除 bos 和 eos token
-                if cfg.data.get('bos_id') is not None and valid_target_ids and valid_target_ids[0] == cfg.data['bos_id']:
-                    valid_target_ids = valid_target_ids[1:]
-                if cfg.data.get('eos_id') is not None and valid_target_ids and valid_target_ids[-1] == cfg.data['eos_id']:
-                    valid_target_ids = valid_target_ids[:-1]
-                
-                # 將 token IDs 轉換為文字
-                if valid_target_ids:
-                    target_text = tokenizer.decode(valid_target_ids)
-                else:
-                    target_text = ''
-                
-                # 計算 CER
-                cer = calculate_cer(pred_text, target_text)
-                total_cer += cer
-                total_samples += 1
-    
-    # 計算平均 CER
-    avg_cer = total_cer / total_samples if total_samples > 0 else 0.0
-    return avg_cer
+# CER 評估相關函數已移至 models/evaluate.py
 
 def main():
     parser = argparse.ArgumentParser(description="FDDM-ASR Training Script")
@@ -524,6 +460,14 @@ def main():
     # ==== Optimizer ====
     params = list(decoder.parameters()) + list(s_proj.parameters()) + list(t_embed.parameters()) + list(t_proj.parameters())
     optim = torch.optim.AdamW(params, lr=cfg.optim['lr'], weight_decay=cfg.optim['weight_decay'])
+    
+    # ==== AMP GradScaler ====
+    # 提升數值穩定性和訓練效率，特別適用於 FP16 訓練
+    scaler = amp.GradScaler('cuda') if torch.cuda.is_available() else None
+    if scaler is not None:
+        print("AMP 已啟用：使用混合精度訓練以提升效能和數值穩定性")
+    else:
+        print("AMP 未啟用：使用標準精度訓練")
 
     # ==== DataLoader（從 train.json, validation.json, test.json 載入真實資料） ====
     train_json = cfg.data.get('train_json', 'data/processed/train.json')
@@ -585,7 +529,8 @@ def main():
         print(f"Epoch {epoch}")
         global_step = train_one_epoch(
             encoder, decoder, s_proj, t_embed, t_proj,
-            scheduler, train_loader, optim, device, cfg, global_step
+            scheduler, train_loader, optim, device, cfg, global_step,
+            scaler  # 傳入 AMP GradScaler
         )
         
         # 每個 epoch 結束後進行訓練 CER 評估
