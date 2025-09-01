@@ -31,6 +31,8 @@ import os
 import argparse
 import random
 import yaml
+import logging
+from datetime import datetime
 from dataclasses import dataclass
 
 import torch
@@ -77,7 +79,7 @@ try:
     from fddm.sched.diffusion_scheduler import DiscreteDiffusionScheduler  # 修正為實際模組路徑
     _SCHED_IMPORT_OK = True
 except Exception as e:
-    print(f"無法匯入 DiscreteDiffusionScheduler: {e}")
+    logging.warning(f"無法匯入 DiscreteDiffusionScheduler: {e}")
     pass
 
 # ============ 資料集骨架（請換成你的前處理） ============
@@ -117,7 +119,7 @@ class CVZhTWDataset(Dataset):
             if processed_path and os.path.exists(processed_path):
                 self.valid_indices.append(i)
         
-        print(f"載入 {len(self.valid_indices)} 個有效樣本從 {json_file}")
+        # logging.info(f"載入 {len(self.valid_indices)} 個有效樣本從 {json_file}") # 在 DataLoader 中打印會造成混亂，暫時註解
     
     def __len__(self):
         return len(self.valid_indices)
@@ -284,7 +286,7 @@ def _iter_with_progress(loader, desc: str, total: int | None = None):
         except Exception:
             return tqdm(loader, desc=desc, leave=False)
     else:
-        print(desc, flush=True)
+        logging.info(desc)
         return loader
 
 # ============ 訓練主流程 ============
@@ -443,11 +445,47 @@ def train_one_epoch(
     # 計算並回傳「本 epoch 平均訓練 loss」
     avg_loss = (epoch_loss_sum / max(1, epoch_step_cnt))
     if print_epoch_summary:
-        print(f"[Summary] Epoch {epoch} Avg Train Loss: {avg_loss:.4f}", flush=True)
+        logging.info(f"[Summary] Epoch {epoch} Avg Train Loss: {avg_loss:.4f}")
     return global_step, avg_loss
 
 
 # ============ 訓練 CER 計算函數 ============
+
+
+def setup_logging():
+    """設定日誌記錄器，同時輸出到控制台和檔案"""
+    log_dir = 'logs' # 註解：定義日誌檔案儲存的資料夾名稱
+    os.makedirs(log_dir, exist_ok=True) # 註解：如果資料夾不存在，則建立它
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S") # 註解：獲取當前時間並格式化為字串，用於日誌檔名
+    log_file = os.path.join(log_dir, f"train_{timestamp}.log") # 註解：組合日誌檔案的完整路徑
+    
+    # 註解：取得根記錄器 (root logger)
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO) # 註解：設定日誌記錄的最低級別為 INFO
+    
+    # 註解：移除任何現有的 handlers，避免重複記錄。這在重新執行 notebook cell 時特別有用。
+    if logger.hasHandlers():
+        logger.handlers.clear()
+
+    # 註解：建立一個檔案 handler，用於將日誌寫入檔案
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    file_handler.setLevel(logging.INFO) # 註解：設定此 handler 的日誌級別
+    
+    # 註解：建立一個控制台 handler，用於將日誌輸出到控制台
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO) # 註解：設定此 handler 的日誌級別
+    
+    # 註解：建立一個格式器 (formatter)，定義日誌訊息的格式
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(formatter) # 註解：為檔案 handler 設定格式
+    console_handler.setFormatter(formatter) # 註解：為控制台 handler 設定格式
+    
+    # 註解：將 handlers 加入到根記錄器中
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+    logging.info("日誌記錄器設定完成。") # 註解：記錄一條訊息，表示設定已完成
 
 
 def main():
@@ -455,6 +493,9 @@ def main():
     parser.add_argument('--config', type=str, required=True)
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     args = parser.parse_args()
+
+    # 設定日誌
+    setup_logging()
 
     # 讀設定
     with open(args.config, 'r', encoding='utf-8') as f:
@@ -505,9 +546,9 @@ def main():
     # ==== AMP GradScaler ====
     scaler = amp.GradScaler('cuda') if torch.cuda.is_available() else None
     if scaler is not None:
-        print("AMP 已啟用：使用混合精度訓練以提升效能和數值穩定性")
+        logging.info("AMP 已啟用：使用混合精度訓練以提升效能和數值穩定性")
     else:
-        print("AMP 未啟用：使用標準精度訓練")
+        logging.info("AMP 未啟用：使用標準精度訓練")
 
     # ==== DataLoader（從 train.json, validation.json, test.json 載入真實資料） ====
     train_json = cfg.data.get('train_json', 'data/processed/train.json')
@@ -565,7 +606,7 @@ def main():
     best_epoch = 0
     
     for epoch in range(1, cfg.optim['num_epochs']+1):
-        print(f"Epoch {epoch}")
+        logging.info(f"Epoch {epoch}")
         global_step, train_loss = train_one_epoch(
             encoder, decoder, s_proj, t_embed, t_proj,
             scheduler, train_loader, optim, device, cfg, global_step,
@@ -600,7 +641,7 @@ def main():
                 }
                 best_path = os.path.join(cfg.log['ckpt_dir'], 'best_model.pt')
                 torch.save(best_ckpt, best_path)
-                print(f"Saved BEST model (epoch {best_epoch}, val_cer {best_val_cer:.4f}) → {best_path}")
+                logging.info(f"Saved BEST model (epoch {best_epoch}, val_cer {best_val_cer:.4f}) → {best_path}")
 
         # —— 每個 epoch 結束後：測試（如有）——
         test_cer = None
@@ -617,7 +658,7 @@ def main():
             msg += f" | val_cer={val_cer:.4f}"
         if test_cer is not None:
             msg += f" | test_cer={test_cer:.4f}"
-        print(msg)
+        logging.info(msg)
 
         # 儲存每個 epoch 的權重（用於恢復訓練）
         ckpt = {
@@ -632,11 +673,11 @@ def main():
         torch.save(ckpt, os.path.join(cfg.log['ckpt_dir'], f"ep{epoch:03d}.pt"))
     
     # 訓練結束後報告最佳權重資訊
-    print("\n" + "="*50)
-    print("TRAINING COMPLETED!")
-    print(f"Best validation CER: {best_val_cer:.4f} (Epoch {best_epoch})")
-    print(f"Best model saved at: {os.path.join(cfg.log['ckpt_dir'], 'best_model.pt')}")
-    print("="*50)
+    logging.info("\n" + "="*50)
+    logging.info("TRAINING COMPLETED!")
+    logging.info(f"Best validation CER: {best_val_cer:.4f} (Epoch {best_epoch})")
+    logging.info(f"Best model saved at: {os.path.join(cfg.log['ckpt_dir'], 'best_model.pt')}")
+    logging.info("="*50)
 
 if __name__ == '__main__':
     main()
