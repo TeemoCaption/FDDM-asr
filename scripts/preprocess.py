@@ -1,42 +1,75 @@
 # -*- coding: utf-8 -*-
 """
-preprocess.py  (本地 Common Voice 版)
+preprocess.py - 自動合併多版本數據集前處理腳本
 
-說明
-----
-本腳本僅支援「本地檔案夾」的 Common Voice 資料，不再使用 Hugging Face 下載。
-請將 Common Voice 官方釋出的壓縮檔解壓到專案的 data/raw 目錄下，例如：
-    data/raw/cv-corpus-22.0-2025-06-20/zh-TW/
-其底下應該長這樣：
-    clips/
-    train.tsv
-    dev.tsv
-    test.tsv
-    validated.tsv
-    ...
+功能特色
+--------
+✅ 自動發現 data/raw/ 下的所有數據集版本
+✅ 智能去重：基於文本相似度和音檔 hash
+✅ 統一輸出：生成標準的 train.json, dev.json, test.json
+✅ 批次處理：記憶體優化，支援大型數據集
+✅ 版本管理：追蹤數據來源，生成詳細報告
+✅ 向後兼容：保留原有單一數據集處理功能
 
-輸出
-----
-在專案目錄下建立：
-    data/processed/clips/             # 轉檔後的 16kHz WAV
-    data/processed/{split}.json       # 索引（每行一筆 JSON 物件）
-    data/processed/{split}.csv        # 索引（CSV 版）
-其中 split 可能為 train / dev / test / validated 等。
+數據結構
+--------
+請將 Common Voice 官方釋出的壓縮檔解壓到專案的 data/raw 目錄下：
+    data/raw/
+    ├── cv-corpus-22.0-2025-06-20/
+    │   └── zh-TW/
+    │       ├── clips/
+    │       ├── train.tsv
+    │       ├── dev.tsv
+    │       └── test.tsv
+    ├── cv-corpus-23.0-2025-12-20/
+    │   └── zh-TW/
+    │       ├── clips/
+    │       ├── train.tsv
+    │       ├── dev.tsv
+    │       └── test.tsv
+    └── ...
+
+輸出結構
+--------
+data/processed/
+├── clips/                    # 轉檔後的 16kHz WAV
+├── train.json               # 訓練集索引（合併後）
+├── dev.json                 # 驗證集索引（合併後）
+├── test.json                # 測試集索引（合併後）
+├── merge_report.json        # 合併報告
+└── duplicates_removed.json  # 去重記錄
 
 使用範例
 --------
+# 自動處理所有版本（推薦）
+python preprocess.py --auto_merge
+
+# 指定特定版本
+python preprocess.py --dataset_names "cv-corpus-22.0,cv-corpus-23.0" --auto_merge
+
+# 調整去重參數
+python preprocess.py --auto_merge --text_similarity_threshold 0.9 --enable_audio_hash
+
+# 傳統單一數據集模式（向後兼容）
 python preprocess.py --dataset_name "cv-corpus-22.0-2025-06-20" --splits "train,dev,test"
 
-註：腳本會自動偵測資料集中的所有語言資料夾並處理，使用預設時長過濾（0.1s-30s）
-
-參數說明在 main() 底下有詳細註解。
+重要特性
+--------
+- 自動去重：避免不同版本間的重複音檔
+- 文本相似度檢查：可調整閾值（預設 0.95）
+- 音檔 hash 檢查：可選啟用，更精確但計算量大
+- 批次處理：記憶體友善，支援大型數據集
+- 詳細報告：追蹤處理過程和統計資訊
 """
 
 import os
 import json
 import argparse
 import re
-from typing import Dict, List
+import hashlib
+from typing import Dict, List, Set, Tuple, Optional
+from collections import defaultdict
+from difflib import SequenceMatcher
 
 import pandas as pd
 import librosa
@@ -159,6 +192,54 @@ def read_split_tsv(cv_lang_dir: str, split_name: str) -> pd.DataFrame:
     return df[["path", "sentence"]]
 
 
+def detect_datasets(dataset_names: Optional[List[str]] = None) -> List[str]:
+    """
+    自動發現 data/raw/ 下的所有數據集版本
+    
+    參數
+    ----
+    dataset_names : 指定的數據集名稱列表，None 表示自動發現所有
+    
+    回傳
+    ----
+    數據集名稱列表
+    """
+    if dataset_names:
+        # 使用指定的數據集名稱
+        datasets = []
+        for name in dataset_names:
+            dataset_path = os.path.join(RAW_DIR, name)
+            if os.path.isdir(dataset_path):
+                datasets.append(name)
+            else:
+                print(f"警告：指定的數據集不存在：{dataset_path}")
+        return datasets
+    
+    # 自動發現所有數據集
+    datasets = []
+    if not os.path.isdir(RAW_DIR):
+        print(f"警告：raw 目錄不存在：{RAW_DIR}")
+        return datasets
+    
+    for item in os.listdir(RAW_DIR):
+        item_path = os.path.join(RAW_DIR, item)
+        if os.path.isdir(item_path) and not item.startswith('.'):
+            # 檢查是否包含語言子目錄
+            has_language_dirs = False
+            for subitem in os.listdir(item_path):
+                subitem_path = os.path.join(item_path, subitem)
+                if os.path.isdir(subitem_path):
+                    clips_path = os.path.join(subitem_path, "clips")
+                    if os.path.isdir(clips_path):
+                        has_language_dirs = True
+                        break
+            
+            if has_language_dirs:
+                datasets.append(item)
+    
+    return sorted(datasets)  # 按名稱排序確保一致性
+
+
 def detect_languages(cv_root: str) -> List[str]:
     """
     自動偵測資料集中的語言資料夾
@@ -187,21 +268,127 @@ def detect_languages(cv_root: str) -> List[str]:
     return sorted(languages)  # 排序以確保一致性
 
 
-def process_language_batch(dataset_name: str,
-                           language: str,
-                           splits: List[str],
-                           batch_size: int = 1000) -> float:
+def calculate_audio_hash(file_path: str) -> Optional[str]:
     """
-    批次處理單一語言的資料集，避免一次性載入所有資料到記憶體
+    計算音檔的 MD5 hash 值用於去重
     
     參數
     ----
-    batch_size : 每個批次處理的檔案數量，預設 1000
+    file_path : 音檔路徑
     
-    回傳：該語言所有有效音檔的總時長（秒數）
+    回傳
+    ----
+    MD5 hash 字串，失敗時回傳 None
     """
+    try:
+        hash_md5 = hashlib.md5()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hash_md5.update(chunk)
+        return hash_md5.hexdigest()
+    except Exception as e:
+        print(f"計算音檔 hash 失敗：{file_path} | {e}")
+        return None
+
+
+def text_similarity(text1: str, text2: str) -> float:
+    """
+    計算兩個文本的相似度
+    
+    參數
+    ----
+    text1, text2 : 要比較的文本
+    
+    回傳
+    ----
+    相似度分數 (0.0 到 1.0)
+    """
+    return SequenceMatcher(None, text1, text2).ratio()
+
+
+def is_duplicate_record(record: dict, 
+                       seen_texts: Set[str], 
+                       text_to_records: Dict[str, List[dict]], 
+                       seen_audio_hashes: Set[str],
+                       text_similarity_threshold: float = 0.95,
+                       enable_audio_hash: bool = False) -> Tuple[bool, str]:
+    """
+    檢查記錄是否為重複
+    
+    參數
+    ----
+    record : 要檢查的記錄
+    seen_texts : 已見過的文本集合
+    text_to_records : 文本到記錄的映射
+    seen_audio_hashes : 已見過的音檔 hash 集合
+    text_similarity_threshold : 文本相似度閾值
+    enable_audio_hash : 是否啟用音檔 hash 檢查
+    
+    回傳
+    ----
+    (是否重複, 重複原因)
+    """
+    text = record.get('text', '').strip()
+    
+    # 1. 完全相同的文本
+    if text in seen_texts:
+        return True, "完全相同的文本"
+    
+    # 2. 高相似度文本檢查
+    for existing_text in seen_texts:
+        if text_similarity(text, existing_text) >= text_similarity_threshold:
+            return True, f"高相似度文本 (相似度 >= {text_similarity_threshold})"
+    
+    # 3. 音檔 hash 檢查（如果啟用）
+    if enable_audio_hash and 'audio_hash' in record:
+        audio_hash = record['audio_hash']
+        if audio_hash and audio_hash in seen_audio_hashes:
+            return True, "相同的音檔 hash"
+    
+    return False, ""
+
+
+def process_language_batch(dataset_name: str,
+                           language: str,
+                           splits: List[str],
+                           batch_size: int = 1000,
+                           seen_texts: Optional[Set[str]] = None,
+                           seen_audio_hashes: Optional[Set[str]] = None,
+                           text_similarity_threshold: float = 0.95,
+                           enable_audio_hash: bool = False) -> Tuple[float, Dict]:
+    """
+    批次處理單一語言的資料集，避免一次性載入所有資料到記憶體，支援去重功能
+    
+    參數
+    ----
+    dataset_name : 數據集名稱
+    language : 語言代碼
+    splits : 要處理的分割列表
+    batch_size : 每個批次處理的檔案數量，預設 1000
+    seen_texts : 已見過的文本集合（用於去重）
+    seen_audio_hashes : 已見過的音檔 hash 集合（用於去重）
+    text_similarity_threshold : 文本相似度閾值
+    enable_audio_hash : 是否啟用音檔 hash 檢查
+    
+    回傳：(該語言所有有效音檔的總時長（秒數）, 統計資訊字典)
+    """
+    # 初始化去重集合（如果未提供）
+    if seen_texts is None:
+        seen_texts = set()
+    if seen_audio_hashes is None:
+        seen_audio_hashes = set()
+    
     # 初始化該語言的總時長變數
     total_duration_lang = 0.0
+    
+    # 統計資訊
+    stats = {
+        'total_found': 0,           # 總發現檔案數
+        'total_processed': 0,       # 總處理檔案數
+        'duplicates_removed': 0,    # 去重移除數
+        'invalid_files': 0,         # 無效檔案數
+        'duplicates_detail': []     # 重複記錄詳情
+    }
     
     # 固定從 data/raw 讀取資料集
     cv_root = os.path.join(RAW_DIR, dataset_name)              # e.g. data/raw/cv-corpus-22.0-2025-06-20
@@ -228,10 +415,13 @@ def process_language_batch(dataset_name: str,
         # 新增欄位：正規化文本和語言標記
         df["text"] = df["sentence"].apply(normalize_text)
         df["language"] = language
+        
+        # 統計總發現檔案數
+        stats['total_found'] += len(df)
 
-        # 準備輸出檔案路徑
-        jsonl_path = os.path.join(PROCESSED_DIR, f"{language}_{split}.json")
-        csv_path = os.path.join(PROCESSED_DIR, f"{language}_{split}.csv")
+        # 準備輸出檔案路徑（暫時使用語言_分割格式，稍後會合併）
+        jsonl_path = os.path.join(PROCESSED_DIR, f"{language}_{split}_temp.json")
+        csv_path = os.path.join(PROCESSED_DIR, f"{language}_{split}_temp.csv")
         
         # 確保輸出目錄存在
         os.makedirs(os.path.dirname(jsonl_path), exist_ok=True)
@@ -260,18 +450,61 @@ def process_language_batch(dataset_name: str,
 
                 if not os.path.isfile(src_fp):
                     # 少數 .tsv 可能引用不存在的檔案，略過並提示
+                    stats['invalid_files'] += 1
+                    continue
+
+                # 計算音檔 hash（如果啟用）
+                audio_hash = None
+                if enable_audio_hash:
+                    audio_hash = calculate_audio_hash(src_fp)
+
+                # 創建臨時記錄用於去重檢查
+                temp_record = {
+                    'text': row["text"],
+                    'sentence': row["sentence"],
+                    'audio_hash': audio_hash,
+                    'dataset': dataset_name,
+                    'language': language,
+                    'split': split,
+                    'path': rel_path
+                }
+
+                # 檢查是否為重複記錄
+                is_duplicate, duplicate_reason = is_duplicate_record(
+                    temp_record, seen_texts, {}, seen_audio_hashes,
+                    text_similarity_threshold, enable_audio_hash
+                )
+
+                if is_duplicate:
+                    stats['duplicates_removed'] += 1
+                    stats['duplicates_detail'].append({
+                        'path': rel_path,
+                        'text': row["text"],
+                        'reason': duplicate_reason,
+                        'dataset': dataset_name,
+                        'language': language,
+                        'split': split
+                    })
                     continue
 
                 duration = to_wav_16k_mono(src_fp, out_abs, target_sr=16000)
 
                 # 失敗就跳過
                 if duration <= 0:
+                    stats['invalid_files'] += 1
                     continue
 
                 # 篩時長（使用固定的合理範圍）
                 min_dur, max_dur = 0.1, 30.0  # 0.1秒到30秒的合理範圍
                 if duration < min_dur or duration > max_dur:
+                    stats['invalid_files'] += 1
                     continue
+
+                # 記錄為已處理（加入去重集合）
+                seen_texts.add(row["text"])
+                if audio_hash:
+                    seen_audio_hashes.add(audio_hash)
+                stats['total_processed'] += 1
 
                 # 累加該 split 的總時長
                 total_duration_split += duration
@@ -286,6 +519,9 @@ def process_language_batch(dataset_name: str,
                     "duration": round(float(duration), 3),
                     "processed_path": out_rel.replace("\\", "/"),
                     "language": language,
+                    "dataset": dataset_name,
+                    "split": split,
+                    "audio_hash": audio_hash if enable_audio_hash else None,
                 })
                 
                 # 如果批次記錄達到一定大小，就寫入檔案並清空
@@ -350,18 +586,140 @@ def process_language_batch(dataset_name: str,
         hours_split = total_duration_split / 3600.0
         print(f"完成 {language} - {split}: 音檔 {total_valid_files} 筆 | 索引：{jsonl_path} / {csv_path} | 總時長：{hours_split:.2f} 小時")
     
-    # 印出該語言的總時長
+    # 印出該語言的總時長和統計資訊
     hours_lang = total_duration_lang / 3600.0
     print(f"完成語言 {language}: 總時長 {hours_lang:.2f} 小時")
+    print(f"  - 總發現檔案: {stats['total_found']}")
+    print(f"  - 成功處理: {stats['total_processed']}")
+    print(f"  - 去重移除: {stats['duplicates_removed']}")
+    print(f"  - 無效檔案: {stats['invalid_files']}")
     
-    return total_duration_lang
+    return total_duration_lang, stats
+
+def build_manifests_auto_merge(dataset_names: Optional[List[str]] = None,
+                               language: Optional[str] = None,
+                               splits: List[str] = ["train", "dev", "test"],
+                               batch_size: int = 1000,
+                               text_similarity_threshold: float = 0.95,
+                               enable_audio_hash: bool = False) -> Dict:
+    """
+    自動合併多版本數據集的主要函數
+    
+    參數
+    ----
+    dataset_names : 指定的數據集名稱列表，None 表示自動發現所有
+    language : 指定語言，None 表示自動偵測所有語言
+    splits : 要處理的分割列表
+    batch_size : 批次處理大小
+    text_similarity_threshold : 文本相似度閾值
+    enable_audio_hash : 是否啟用音檔 hash 檢查
+    
+    回傳：合併統計資訊字典
+    """
+    # 初始化全域去重集合
+    global_seen_texts = set()
+    global_seen_audio_hashes = set()
+    
+    # 初始化統計資訊
+    merge_stats = {
+        'total_duration': 0.0,
+        'total_datasets': 0,
+        'total_languages': 0,
+        'datasets_processed': [],
+        'languages_processed': set(),
+        'split_stats': {split: {'records': [], 'total_duration': 0.0} for split in splits},
+        'global_stats': {
+            'total_found': 0,
+            'total_processed': 0,
+            'duplicates_removed': 0,
+            'invalid_files': 0,
+            'duplicates_detail': []
+        }
+    }
+    
+    # 自動發現數據集
+    datasets = detect_datasets(dataset_names)
+    if not datasets:
+        raise ValueError("找不到任何數據集，請檢查 data/raw/ 目錄")
+    
+    print(f"發現數據集：{datasets}")
+    merge_stats['total_datasets'] = len(datasets)
+    
+    # 處理每個數據集
+    for dataset_name in datasets:
+        print(f"\n{'='*60}")
+        print(f"處理數據集：{dataset_name}")
+        print(f"{'='*60}")
+        
+        cv_root = os.path.join(RAW_DIR, dataset_name)
+        
+        # 檢查數據集是否存在
+        if not os.path.isdir(cv_root):
+            print(f"跳過不存在的數據集：{cv_root}")
+            continue
+        
+        # 自動偵測語言或使用指定語言
+        if language:
+            languages = [language]
+            print(f"使用指定語言：{language}")
+        else:
+            languages = detect_languages(cv_root)
+            if not languages:
+                print(f"在 {dataset_name} 中找不到任何語言資料夾")
+                continue
+            print(f"自動偵測到語言：{languages}")
+        
+        merge_stats['languages_processed'].update(languages)
+        
+        # 處理每個語言
+        for lang in languages:
+            try:
+                print(f"\n處理 {dataset_name} - {lang}")
+                
+                # 批次處理單一語言並獲取其總時長和統計
+                duration_lang, lang_stats = process_language_batch(
+                    dataset_name, lang, splits, batch_size,
+                    global_seen_texts, global_seen_audio_hashes,
+                    text_similarity_threshold, enable_audio_hash
+                )
+                
+                # 累加到總時長
+                merge_stats['total_duration'] += duration_lang
+                
+                # 累加統計資訊
+                merge_stats['global_stats']['total_found'] += lang_stats['total_found']
+                merge_stats['global_stats']['total_processed'] += lang_stats['total_processed']
+                merge_stats['global_stats']['duplicates_removed'] += lang_stats['duplicates_removed']
+                merge_stats['global_stats']['invalid_files'] += lang_stats['invalid_files']
+                merge_stats['global_stats']['duplicates_detail'].extend(lang_stats['duplicates_detail'])
+                
+            except Exception as e:
+                print(f"處理語言 {lang} 時發生錯誤：{e}")
+                continue
+        
+        merge_stats['datasets_processed'].append(dataset_name)
+    
+    merge_stats['total_languages'] = len(merge_stats['languages_processed'])
+    
+    # 合併臨時檔案為統一的索引檔案
+    print(f"\n{'='*60}")
+    print("合併臨時檔案為統一索引...")
+    print(f"{'='*60}")
+    
+    merge_temp_files_to_unified(splits, merge_stats)
+    
+    # 生成合併報告
+    generate_merge_report(merge_stats)
+    
+    return merge_stats
+
 
 def build_manifests_batch(dataset_name: str,
                          language: str,
                          splits: List[str],
                          batch_size: int = 1000) -> float:
     """
-    批次處理主要函數：自動偵測語言並使用批次處理所有資料
+    批次處理主要函數：自動偵測語言並使用批次處理所有資料（向後兼容）
     
     參數
     ----
@@ -369,59 +727,171 @@ def build_manifests_batch(dataset_name: str,
     
     回傳：整個資料集的有效音檔總時長（秒數）
     """
-    # 初始化整個資料集的總時長變數
-    total_duration_dataset = 0.0
+    # 使用新的合併函數
+    merge_stats = build_manifests_auto_merge(
+        dataset_names=[dataset_name],
+        language=language,
+        splits=splits,
+        batch_size=batch_size
+    )
     
-    # 固定從 data/raw 讀取資料集
-    cv_root = os.path.join(RAW_DIR, dataset_name)              # e.g. data/raw/cv-corpus-22.0-2025-06-20
+    return merge_stats['total_duration']
+
+
+def merge_temp_files_to_unified(splits: List[str], merge_stats: Dict):
+    """
+    合併臨時檔案為統一的索引檔案（train.json, dev.json, test.json）
     
-    # 檢查資料集是否存在
-    if not os.path.isdir(cv_root):
-        raise NotADirectoryError(f"找不到資料集目錄：{cv_root}\n請確認已將 Common Voice 資料集解壓到 data/raw/ 目錄下")
+    參數
+    ----
+    splits : 分割列表
+    merge_stats : 合併統計資訊
+    """
+    for split in splits:
+        unified_records = []
+        total_duration = 0.0
+        
+        print(f"合併 {split} 分割...")
+        
+        # 尋找所有相關的臨時檔案
+        temp_pattern = f"*_{split}_temp.json"
+        temp_files = []
+        
+        for file in os.listdir(PROCESSED_DIR):
+            if file.endswith(f"_{split}_temp.json"):
+                temp_files.append(os.path.join(PROCESSED_DIR, file))
+        
+        # 讀取並合併所有臨時檔案
+        for temp_file in temp_files:
+            if os.path.exists(temp_file):
+                try:
+                    with open(temp_file, "r", encoding="utf-8") as f:
+                        temp_records = json.load(f)
+                        if isinstance(temp_records, list):
+                            unified_records.extend(temp_records)
+                            # 計算該檔案的總時長
+                            for record in temp_records:
+                                total_duration += record.get('duration', 0.0)
+                except Exception as e:
+                    print(f"讀取臨時檔案失敗：{temp_file} | {e}")
+        
+        # 寫入統一的索引檔案
+        if unified_records:
+            unified_json_path = os.path.join(PROCESSED_DIR, f"{split}.json")
+            unified_csv_path = os.path.join(PROCESSED_DIR, f"{split}.csv")
+            
+            # 寫入 JSON 格式
+            with open(unified_json_path, "w", encoding="utf-8") as f:
+                json.dump(unified_records, f, ensure_ascii=False, indent=2)
+            
+            # 寫入 CSV 格式
+            df_unified = pd.DataFrame(unified_records)
+            df_unified.to_csv(unified_csv_path, index=False, encoding="utf-8")
+            
+            # 更新統計資訊
+            merge_stats['split_stats'][split]['records'] = unified_records
+            merge_stats['split_stats'][split]['total_duration'] = total_duration
+            
+            print(f"  - 合併完成：{len(unified_records)} 筆記錄")
+            print(f"  - 總時長：{total_duration/3600.0:.2f} 小時")
+            print(f"  - 輸出檔案：{unified_json_path}")
+            print(f"  - 輸出檔案：{unified_csv_path}")
+        else:
+            print(f"  - 警告：{split} 分割沒有找到任何記錄")
+        
+        # 清理臨時檔案
+        for temp_file in temp_files:
+            try:
+                os.remove(temp_file)
+                # 同時清理對應的 CSV 臨時檔案
+                temp_csv = temp_file.replace('.json', '.csv')
+                if os.path.exists(temp_csv):
+                    os.remove(temp_csv)
+            except Exception as e:
+                print(f"清理臨時檔案失敗：{temp_file} | {e}")
+
+
+def generate_merge_report(merge_stats: Dict):
+    """
+    生成合併報告
     
-    print(f"從資料集讀取：{cv_root}（批次大小：{batch_size}）")
+    參數
+    ----
+    merge_stats : 合併統計資訊
+    """
+    # 生成詳細報告
+    report = {
+        'merge_summary': {
+            'total_datasets': merge_stats['total_datasets'],
+            'total_languages': merge_stats['total_languages'],
+            'datasets_processed': merge_stats['datasets_processed'],
+            'languages_processed': list(merge_stats['languages_processed']),
+            'total_duration_hours': merge_stats['total_duration'] / 3600.0,
+            'processing_timestamp': pd.Timestamp.now().isoformat()
+        },
+        'global_statistics': merge_stats['global_stats'],
+        'split_statistics': {},
+        'duplicates_detail': merge_stats['global_stats']['duplicates_detail']
+    }
     
-    # 自動偵測語言或使用指定語言
-    if language:
-        # 使用指定語言
-        languages = [language]
-        print(f"使用指定語言：{language}")
-    else:
-        # 自動偵測所有語言
-        languages = detect_languages(cv_root)
-        if not languages:
-            raise ValueError(f"在 {cv_root} 中找不到任何語言資料夾")
-        print(f"自動偵測到語言：{languages}")
+    # 添加各分割的統計
+    for split, split_data in merge_stats['split_stats'].items():
+        if split_data['records']:
+            report['split_statistics'][split] = {
+                'total_records': len(split_data['records']),
+                'total_duration_hours': split_data['total_duration'] / 3600.0,
+                'avg_duration_seconds': split_data['total_duration'] / len(split_data['records']) if split_data['records'] else 0
+            }
     
-    # 處理每個語言
-    for lang in languages:
-        try:
-            # 批次處理單一語言並獲取其總時長
-            duration_lang = process_language_batch(dataset_name, lang, splits, batch_size)
-            # 累加到資料集總時長
-            total_duration_dataset += duration_lang
-        except Exception as e:
-            print(f"處理語言 {lang} 時發生錯誤：{e}")
-            continue
+    # 寫入合併報告
+    report_path = os.path.join(PROCESSED_DIR, "merge_report.json")
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
     
-    # 印出整個資料集的總時長
-    hours_dataset = total_duration_dataset / 3600.0
-    print(f"\n資料集總時長：{hours_dataset:.2f} 小時")
+    # 寫入去重記錄
+    if merge_stats['global_stats']['duplicates_detail']:
+        duplicates_path = os.path.join(PROCESSED_DIR, "duplicates_removed.json")
+        with open(duplicates_path, "w", encoding="utf-8") as f:
+            json.dump(merge_stats['global_stats']['duplicates_detail'], f, ensure_ascii=False, indent=2)
     
-    return total_duration_dataset
+    # 印出總結
+    print(f"\n{'='*60}")
+    print("合併完成總結")
+    print(f"{'='*60}")
+    print(f"處理數據集：{merge_stats['total_datasets']} 個")
+    print(f"處理語言：{merge_stats['total_languages']} 個")
+    print(f"總錄製時長：{merge_stats['total_duration']/3600.0:.2f} 小時")
+    print(f"總發現檔案：{merge_stats['global_stats']['total_found']} 個")
+    print(f"成功處理：{merge_stats['global_stats']['total_processed']} 個")
+    print(f"去重移除：{merge_stats['global_stats']['duplicates_removed']} 個")
+    print(f"無效檔案：{merge_stats['global_stats']['invalid_files']} 個")
+    print(f"\n各分割統計：")
+    for split, split_data in merge_stats['split_stats'].items():
+        if split_data['records']:
+            print(f"  - {split}: {len(split_data['records'])} 筆，{split_data['total_duration']/3600.0:.2f} 小時")
+    print(f"\n報告檔案：{report_path}")
+    if merge_stats['global_stats']['duplicates_detail']:
+        print(f"去重記錄：{os.path.join(PROCESSED_DIR, 'duplicates_removed.json')}")
+
 
 # =========================================================
 # 參數與進入點
 # =========================================================
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="將本地 Common Voice 檔案夾轉為訓練可用的 16kHz WAV 與索引檔（記憶體優化版）"
+        description="將本地 Common Voice 檔案夾轉為訓練可用的 16kHz WAV 與索引檔（支援自動合併多版本數據集）"
+    )
+    parser.add_argument(
+        "--dataset_names",
+        type=str,
+        default="",
+        help="指定數據集名稱列表，以逗號分隔。例如：cv-corpus-22.0,cv-corpus-23.0（留空則自動發現所有數據集）"
     )
     parser.add_argument(
         "--dataset_name",
         type=str,
-        required=True,
-        help="資料集資料夾名稱，例如 cv-corpus-22.0-2025-06-20（會從 data/raw/{dataset_name} 讀取）"
+        default="",
+        help="單一資料集名稱（向後兼容參數，建議使用 --dataset_names）"
     )
     parser.add_argument(
         "--language",
@@ -442,6 +912,22 @@ def parse_args():
         help="批次處理大小，減少記憶體使用量。預設 1000（較小的值使用更少記憶體但處理較慢）"
     )
     parser.add_argument(
+        "--text_similarity_threshold",
+        type=float,
+        default=0.95,
+        help="文本相似度閾值，超過此值視為重複。範圍 0.0-1.0，預設 0.95"
+    )
+    parser.add_argument(
+        "--enable_audio_hash",
+        action="store_true",
+        help="啟用音檔 hash 檢查去重（計算量大但更精確）"
+    )
+    parser.add_argument(
+        "--auto_merge",
+        action="store_true",
+        help="啟用自動合併模式（自動發現並合併多版本數據集）"
+    )
+    parser.add_argument(
         "--use_memory_optimized",
         action="store_true",
         help="啟用記憶體優化模式（批次處理 + 串流輸出）"
@@ -455,43 +941,80 @@ def main():
     # 解析 splits
     splits = [s.strip() for s in args.splits.split(",") if s.strip()]
     
-    print(f"開始處理資料集：{args.dataset_name}")
-    if args.language:
-        print(f"指定語言：{args.language}")
-        print(f"資料集路徑：data/raw/{args.dataset_name}/{args.language}/")
-    else:
-        print(f"自動偵測語言模式")
-        print(f"資料集路徑：data/raw/{args.dataset_name}/")
-    print(f"分割：{splits}")
-    print(f"時長過濾：0.1s - 30.0s（固定範圍）")
-    
-    # 根據參數選擇處理模式
-    if args.use_memory_optimized:
-        print(f"記憶體優化模式：啟用（批次大小：{args.batch_size}）")
+    # 決定使用哪種模式
+    if args.auto_merge or (not args.dataset_name and not args.dataset_names):
+        # 自動合併模式
         print("="*60)
+        print("自動合併多版本數據集模式")
+        print("="*60)
+        
+        # 解析數據集名稱
+        dataset_names = None
+        if args.dataset_names:
+            dataset_names = [name.strip() for name in args.dataset_names.split(",") if name.strip()]
+        elif args.dataset_name:
+            dataset_names = [args.dataset_name]
+        
+        print(f"分割：{splits}")
+        print(f"時長過濾：0.1s - 30.0s（固定範圍）")
+        print(f"文本相似度閾值：{args.text_similarity_threshold}")
+        print(f"音檔 hash 檢查：{'啟用' if args.enable_audio_hash else '停用'}")
+        print(f"批次大小：{args.batch_size}")
+        
+        # 執行自動合併
+        merge_stats = build_manifests_auto_merge(
+            dataset_names=dataset_names,
+            language=args.language if args.language else None,
+            splits=splits,
+            batch_size=args.batch_size,
+            text_similarity_threshold=args.text_similarity_threshold,
+            enable_audio_hash=args.enable_audio_hash
+        )
+        
+        print("\n自動合併完成！")
+        print("輸出檔案：")
+        for split in splits:
+            json_path = os.path.join(PROCESSED_DIR, f"{split}.json")
+            if os.path.exists(json_path):
+                print(f"  - {json_path}")
+        
+    else:
+        # 傳統單一數據集模式（向後兼容）
+        dataset_name = args.dataset_name or (args.dataset_names.split(",")[0] if args.dataset_names else "")
+        if not dataset_name:
+            print("錯誤：請指定 --dataset_name 或使用 --auto_merge 模式")
+            return
+        
+        print(f"開始處理資料集：{dataset_name}")
+        if args.language:
+            print(f"指定語言：{args.language}")
+            print(f"資料集路徑：data/raw/{dataset_name}/{args.language}/")
+        else:
+            print(f"自動偵測語言模式")
+            print(f"資料集路徑：data/raw/{dataset_name}/")
+        print(f"分割：{splits}")
+        print(f"時長過濾：0.1s - 30.0s（固定範圍）")
+        
+        # 根據參數選擇處理模式
+        if args.use_memory_optimized:
+            print(f"記憶體優化模式：啟用（批次大小：{args.batch_size}）")
+            print("="*60)
+        else:
+            print(f"標準模式（若記憶體不足，請使用 --use_memory_optimized）")
+            print("="*50)
         
         # 執行批次處理模式
         total_duration = build_manifests_batch(
-            dataset_name=args.dataset_name,
+            dataset_name=dataset_name,
             language=args.language if args.language else None,
             splits=splits,
             batch_size=args.batch_size
         )
-    else:
-        print(f"標準模式（若記憶體不足，請使用 --use_memory_optimized）")
-        print("="*50)
         
-        # 執行標準處理模式
-        total_duration = build_manifests_batch(  # 修正函數名稱為 build_manifests_batch，用於批次處理資料集
-            dataset_name=args.dataset_name,
-            language=args.language if args.language else None,
-            splits=splits,
-        )
-    
-    # 印出總錄製時數
-    total_hours = total_duration / 3600.0
-    print(f"\n總錄製時數：{total_hours:.2f} 小時")
-    print("全部完成。你可以在 data/processed/ 找到索引與轉檔後音檔。")
+        # 印出總錄製時數
+        total_hours = total_duration / 3600.0
+        print(f"\n總錄製時數：{total_hours:.2f} 小時")
+        print("全部完成。你可以在 data/processed/ 找到索引與轉檔後音檔。")
 
 
 if __name__ == "__main__":

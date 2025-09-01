@@ -17,10 +17,11 @@
 │   │   │   └── ... (其他語言)
 │   └── processed/             # 處理後的資料目錄
 │       ├── clips/             # 轉檔後的 16kHz WAV 檔案
-│       ├── zh-TW_train.json   # 繁體中文訓練集索引
-│       ├── zh-TW_dev.json     # 繁體中文開發集索引
-│       ├── zh-TW_test.json    # 繁體中文測試集索引
-│       └── ... (其他語言的索引檔案)
+│       ├── train.json         # 訓練集索引 (合併後)
+│       ├── dev.json           # 開發集索引 (合併後)
+│       ├── test.json          # 測試集索引 (合併後)
+│       ├── merge_report.json  # 合併報告
+│       └── duplicates_removed.json # 去重記錄
 ├── configs/                    # 模型與訓練設定檔
 │   ├── fddm_zhTW_base.yaml     # 主要訓練配置（繁體中文）
 │   ├── fddm_sweep.yaml         # 超參數搜尋配置
@@ -92,59 +93,48 @@ data/raw/cv-corpus-22.0-2025-06-20/
 - 不要修改資料集的原始結構
 - 腳本會自動偵測所有語言資料夾
 
-### 3. 資料前處理
+### 3. 資料前處理 (自動合併與去重)
 
-執行自動化前處理腳本：
+執行具備自動合併與去重功能的前處理腳本。此腳本會自動處理 `data/raw/` 下的所有數據集版本，並生成統一的索引檔案。
+
+#### 主要指令
+
 ```bash
-python scripts/preprocess.py --dataset_name "cv-corpus-22.0-2025-06-20"
+# 推薦：自動發現、處理並合併所有數據集
+python scripts/preprocess.py --auto_merge
+
+# 指定特定幾個版本進行合併
+python scripts/preprocess.py --auto_merge --dataset_names "cv-corpus-22.0,cv-corpus-23.0"
+
+# 調整去重參數（可選）
+python scripts/preprocess.py --auto_merge --text_similarity_threshold 0.9 --enable_audio_hash
 ```
 
-腳本會自動：
-- 偵測所有語言資料夾
-- 處理所有分割 (train/dev/test)
-- 轉換音檔為 16kHz WAV 格式
-- 產生標準化的索引檔案
-- 自動進行時長過濾 (0.1s-30s)
-- **統計總錄製時數**：完成後顯示資料集總時長
+#### 功能亮點
+- **自動發現**：掃描 `data/raw/` 目錄，無需手動指定每個版本。
+- **智能去重**：跨版本進行文本相似度與音檔 Hash 去重，確保資料品質。
+- **統一輸出**：生成標準的 `train.json`, `dev.json`, `test.json`。
+- **批次處理**：內建記憶體優化，可處理極大型資料集。
+- **詳細報告**：生成 `merge_report.json` 和 `duplicates_removed.json` 供分析。
 
-### 記憶體優化模式
+#### 處理輸出範例
 
-對於大型資料集，建議使用記憶體優化模式：
-```bash
-# 小型資料集（預設模式）
-python scripts/preprocess.py --dataset_name "cv-corpus-22.0-2025-06-20"
-
-# 大型資料集（記憶體優化模式）
-python scripts/preprocess.py --dataset_name "cv-corpus-22.0-2025-06-20" --use_memory_optimized --batch_size 500
-
-# 指定特定語言
-python scripts/preprocess.py --dataset_name "cv-corpus-22.0-2025-06-20" --language "zh-TW" --use_memory_optimized --batch_size 1000
 ```
-
-**記憶體優化參數說明：**
-- `--use_memory_optimized`：啟用記憶體優化模式（批次處理 + 串流輸出）
-- `--batch_size`：批次處理大小（預設 1000，較小的值使用更少記憶體但處理較慢）
-- `--language`：指定處理特定語言（留空則自動偵測所有語言）
-
-**記憶體使用比較：**
-- **標準模式**：記憶體使用量與資料集大小成正比，適合小於 10,000 個檔案的資料集
-- **優化模式**：記憶體使用量固定在批次大小範圍內，適合任何大小的資料集
-
-**處理輸出範例：**
-```
-批次處理語言：zh-TW（批次大小：500）
-語言目錄：data/raw/cv-corpus-22.0-2025-06-20/zh-TW
-=== 批次處理 zh-TW - train ===
-處理批次 0-500（總共 15230）
-已寫入批次資料，釋放記憶體（當前批次記錄數：0）
-處理批次 500-1000（總共 15230）
+發現數據集：['cv-corpus-22.0-2025-06-20', 'cv-corpus-23.0-2025-12-20']
+============================================================
+處理數據集：cv-corpus-22.0-2025-06-20
+============================================================
 ...
-完成 zh-TW - train: 音檔 15230 筆 | 索引：data/processed/zh-TW_train.json / data/processed/zh-TW_train.csv | 總時長：45.67 小時
-完成語言 zh-TW: 總時長 45.67 小時
-資料集總時長：45.67 小時
-
-總錄製時數：45.67 小時
-全部完成。你可以在 data/processed/ 找到索引與轉檔後音檔。
+批次處理語言：zh-TW（批次大小：1000）
+...
+============================================================
+合併臨時檔案為統一索引...
+============================================================
+合併 train 分割...
+  - 合併完成：25000 筆記錄
+  - 總時長：75.12 小時
+  - 輸出檔案：data/processed/train.json
+...
 ```
 
 ### 4. Git 設定
@@ -174,14 +164,10 @@ pip install -r requirements.txt
 
 ### 3. 自動化前處理
 
-#### 標準模式（適合小型資料集）
-```bash
-python scripts/preprocess.py --dataset_name "cv-corpus-22.0-2025-06-20"
-```
+推薦使用 `--auto_merge` 模式，它會自動處理 `data/raw/` 下的所有數據集版本，並進行去重與合併。
 
-#### 記憶體優化模式（適合大型資料集）
 ```bash
-python scripts/preprocess.py --dataset_name "cv-corpus-22.0-2025-06-20" --use_memory_optimized --batch_size 500
+python scripts/preprocess.py --auto_merge
 ```
 
 ### 4. 訓練 Tokenizer
@@ -240,9 +226,9 @@ ckpts/fddm_zhTW_base/
 ```yaml
 # 資料設定
 data:
-  train_json: data/processed/zh-TW_train.json      # 更新路徑
-  val_json: data/processed/zh-TW_dev.json           # 更新路徑
-  test_json: data/processed/zh-TW_test.json         # 更新路徑
+  train_json: data/processed/train.json      # 合併後的訓練集
+  val_json: data/processed/dev.json        # 合併後的開發集
+  test_json: data/processed/test.json      # 合併後的測試集
   vocab_size: 8000
   max_len: 128
 

@@ -159,16 +159,66 @@ def export_vocab_json(sp_model_path: str, save_json_path: str):
         json.dump(payload, f, ensure_ascii=False, indent=2)
     print(f"[OK] 輸出 vocab JSON：{save_json_path}")
 
+def discover_corpus_files(corpus_cfg: dict) -> list:
+    """
+    自動偵測語料庫 JSON 檔案。
+    優先尋找合併後的檔案 (train.json, dev.json, test.json)。
+    若找不到，則使用 lang_prefix 尋找帶前綴的檔案 (e.g., zh-TW_train.json)。
+    """
+    base_path = corpus_cfg.get("base_path", "data/processed")
+    lang_prefix = corpus_cfg.get("lang_prefix")
+
+    # 1. 優先偵測合併後的標準檔名 (由 --auto_merge 產生)
+    # 注意：--auto_merge 產生的是 dev.json，而單一資料集是 validation.json
+    merged_files = [
+        os.path.join(base_path, "train.json"),
+        os.path.join(base_path, "dev.json"),
+        os.path.join(base_path, "test.json"),
+    ]
+
+    # 以 train.json 是否存在為主要判斷依據
+    if os.path.exists(merged_files[0]):
+        print("[INFO] 偵測到合併後的語料庫檔案 (train.json)，將使用合併檔案進行訓練。")
+        # 找出實際存在的檔案列表
+        found_files = [f for f in merged_files if os.path.exists(f)]
+        if found_files:
+            print(f"[INFO] 將使用以下檔案: {found_files}")
+            return found_files
+
+    # 2. 若合併檔不存在，回退到使用 lang_prefix 尋找
+    if not lang_prefix:
+        raise ValueError("找不到合併檔案 (train.json)，且設定檔中未提供 'lang_prefix'。")
+
+    print(f"[INFO] 未偵測到合併檔案，將使用語言前綴 '{lang_prefix}' 尋找檔案。")
+    prefixed_files = [
+        os.path.join(base_path, f"{lang_prefix}_train.json"),
+        os.path.join(base_path, f"{lang_prefix}_validation.json"),
+        os.path.join(base_path, f"{lang_prefix}_test.json"),
+    ]
+    found_files = [f for f in prefixed_files if os.path.exists(f)]
+
+    if not found_files:
+        raise FileNotFoundError(
+            f"使用前綴 '{lang_prefix}' 找不到任何語料庫檔案。請檢查 `preprocess.py` 是否已成功執行，"
+            f"以及 `configs/tokenizer_zhTW.yaml` 中的 `lang_prefix` 是否正確。"
+        )
+
+    print(f"[INFO] 將使用以下檔案: {found_files}")
+    return found_files
+
 def main():
-    parser = argparse.ArgumentParser(description="訓練 SentencePiece tokenizer（適用 zh-TW A 案）")
+    parser = argparse.ArgumentParser(description="訓練 SentencePiece tokenizer")
     parser.add_argument("--config", type=str, required=True, help="YAML 設定檔路徑（例：configs/tokenizer_zhTW.yaml）")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
 
+    # 自動偵測要使用的語料庫檔案
+    corpus_files = discover_corpus_files(cfg["corpus"])
+
     # 讀取語料
     texts = prepare_corpus_text_from_json(
-        index_json_files=cfg["corpus"]["index_json_files"],
+        index_json_files=corpus_files,
         text_field=cfg["corpus"]["text_field"],
         min_len=cfg["corpus"].get("min_len", 1),
         max_len=cfg["corpus"].get("max_len", None)
