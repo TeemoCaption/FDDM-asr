@@ -187,31 +187,38 @@ def detect_languages(cv_root: str) -> List[str]:
     return sorted(languages)  # 排序以確保一致性
 
 
-def process_language(dataset_name: str,
-                    language: str,
-                    splits: List[str]) -> None:
+def process_language_batch(dataset_name: str,
+                           language: str,
+                           splits: List[str],
+                           batch_size: int = 1000) -> float:
     """
-    處理單一語言的資料集
+    批次處理單一語言的資料集，避免一次性載入所有資料到記憶體
     
-    索引欄位（與你先前的訓練流程相容）：
-      - path            : 原始相對路徑（相對於 Common Voice 的 clips/）
-      - sentence        : 原始句子
-      - text            : 正規化後句子
-      - duration        : 轉檔後音檔秒數
-      - processed_path  : 相對於專案根目錄的路徑，例如 data/processed/clips/train_xxx.wav
-      - language        : 語言代碼（新增欄位）
+    參數
+    ----
+    batch_size : 每個批次處理的檔案數量，預設 1000
+    
+    回傳：該語言所有有效音檔的總時長（秒數）
     """
+    # 初始化該語言的總時長變數
+    total_duration_lang = 0.0
+    
     # 固定從 data/raw 讀取資料集
     cv_root = os.path.join(RAW_DIR, dataset_name)              # e.g. data/raw/cv-corpus-22.0-2025-06-20
     cv_lang_dir = os.path.join(cv_root, language)             # e.g. data/raw/cv-corpus-22.0.../zh-TW
     clips_dir = os.path.join(cv_lang_dir, "clips")            # e.g. .../zh-TW/clips
     
-    print(f"\n處理語言：{language}")
+    print(f"\n批次處理語言：{language}（批次大小：{batch_size}）")
     print(f"語言目錄：{cv_lang_dir}")
 
     # 逐個 split 處理
     for split in splits:
-        print(f"=== 處理 {language} - {split} ===")
+        print(f"=== 批次處理 {language} - {split} ===")
+        # 初始化該 split 的總時長變數
+        total_duration_split = 0.0
+        # 初始化該 split 的有效檔案計數
+        total_valid_files = 0
+        
         try:
             df = read_split_tsv(cv_lang_dir, split)               # 讀 TSV
         except FileNotFoundError:
@@ -222,73 +229,149 @@ def process_language(dataset_name: str,
         df["text"] = df["sentence"].apply(normalize_text)
         df["language"] = language
 
-        # 準備輸出清單
-        records = []
-        pbar = tqdm(total=len(df), desc=f"轉檔 {language}-{split}", ncols=100)
+        # 準備輸出檔案路徑
+        jsonl_path = os.path.join(PROCESSED_DIR, f"{language}_{split}.json")
+        csv_path = os.path.join(PROCESSED_DIR, f"{language}_{split}.csv")
+        
+        # 確保輸出目錄存在
+        os.makedirs(os.path.dirname(jsonl_path), exist_ok=True)
+        
+        # 初始化批次資料
+        batch_records = []
+        batch_start_idx = 0
+        
+        # 分批處理 DataFrame
+        for batch_start_idx in range(0, len(df), batch_size):
+            batch_end_idx = min(batch_start_idx + batch_size, len(df))
+            batch_df = df.iloc[batch_start_idx:batch_end_idx]
+            
+            print(f"處理批次 {batch_start_idx}-{batch_end_idx}（總共 {len(df)}）")
+            
+            # 處理當前批次的每個檔案
+            for idx, row in batch_df.iterrows():
+                rel_path = row["path"]                            # 如 'common_voice_zh-TW_12345.mp3'
+                src_fp = os.path.join(clips_dir, rel_path)        # 絕對路徑
 
-        for idx, row in df.iterrows():
-            rel_path = row["path"]                            # 如 'common_voice_zh-TW_12345.mp3'
-            src_fp = os.path.join(clips_dir, rel_path)        # 絕對路徑
+                # 為避免不同語言和 split 同名檔案互相覆蓋，輸出檔名前加上語言和 split 前綴
+                base = os.path.splitext(os.path.basename(rel_path))[0]
+                out_name = f"{language}_{split}_{base}.wav"
+                out_rel = os.path.join("data", "processed", "clips", out_name)     # 存索引時使用相對路徑
+                out_abs = os.path.join(ROOT_DIR, out_rel)                           # 真正寫檔用絕對路徑
 
-            # 為避免不同語言和 split 同名檔案互相覆蓋，輸出檔名前加上語言和 split 前綴
-            base = os.path.splitext(os.path.basename(rel_path))[0]
-            out_name = f"{language}_{split}_{base}.wav"
-            out_rel = os.path.join("data", "processed", "clips", out_name)     # 存索引時使用相對路徑
-            out_abs = os.path.join(ROOT_DIR, out_rel)                           # 真正寫檔用絕對路徑
+                if not os.path.isfile(src_fp):
+                    # 少數 .tsv 可能引用不存在的檔案，略過並提示
+                    continue
 
-            if not os.path.isfile(src_fp):
-                # 少數 .tsv 可能引用不存在的檔案，略過並提示
-                pbar.update(1)
-                continue
+                duration = to_wav_16k_mono(src_fp, out_abs, target_sr=16000)
 
-            duration = to_wav_16k_mono(src_fp, out_abs, target_sr=16000)
-            pbar.update(1)
+                # 失敗就跳過
+                if duration <= 0:
+                    continue
 
-            # 失敗就跳過
-            if duration <= 0:
-                continue
+                # 篩時長（使用固定的合理範圍）
+                min_dur, max_dur = 0.1, 30.0  # 0.1秒到30秒的合理範圍
+                if duration < min_dur or duration > max_dur:
+                    continue
 
-            # 篩時長（使用固定的合理範圍）
-            min_dur, max_dur = 0.1, 30.0  # 0.1秒到30秒的合理範圍
-            if duration < min_dur or duration > max_dur:
-                continue
-
-            records.append({
-                "path": rel_path,
-                "sentence": row["sentence"],
-                "text": row["text"],
-                "duration": round(float(duration), 3),
-                "processed_path": out_rel.replace("\\", "/"),
-                "language": language,
-            })
-
-        pbar.close()
-
-        if not records:
+                # 累加該 split 的總時長
+                total_duration_split += duration
+                # 累加有效檔案數量
+                total_valid_files += 1
+                
+                # 加入批次記錄
+                batch_records.append({
+                    "path": rel_path,
+                    "sentence": row["sentence"],
+                    "text": row["text"],
+                    "duration": round(float(duration), 3),
+                    "processed_path": out_rel.replace("\\", "/"),
+                    "language": language,
+                })
+                
+                # 如果批次記錄達到一定大小，就寫入檔案並清空
+                if len(batch_records) >= 500:
+                    # 串流寫入 JSON（追加模式）
+                    if not os.path.exists(jsonl_path):
+                        # 第一次寫入，建立檔案
+                        with open(jsonl_path, "w", encoding="utf-8") as f:
+                            json.dump(batch_records, f, ensure_ascii=False, indent=2)
+                    else:
+                        # 追加寫入
+                        with open(jsonl_path, "r+", encoding="utf-8") as f:
+                            existing_data = json.load(f)
+                            existing_data.extend(batch_records)
+                            f.seek(0)
+                            json.dump(existing_data, f, ensure_ascii=False, indent=2)
+                            f.truncate()
+                    
+                    # 串流寫入 CSV（追加模式）
+                    batch_df_out = pd.DataFrame(batch_records)
+                    if not os.path.exists(csv_path):
+                        batch_df_out.to_csv(csv_path, index=False, encoding="utf-8")
+                    else:
+                        batch_df_out.to_csv(csv_path, mode='a', header=False, index=False, encoding="utf-8")
+                    
+                    # 清空批次記錄以釋放記憶體
+                    batch_records = []
+                    
+                    print(f"已寫入批次資料，釋放記憶體（當前批次記錄數：{len(batch_records)}）")
+            
+            # 批次處理完成後，立即寫入剩餘記錄
+            if batch_records:
+                # 串流寫入 JSON
+                if not os.path.exists(jsonl_path):
+                    with open(jsonl_path, "w", encoding="utf-8") as f:
+                        json.dump(batch_records, f, ensure_ascii=False, indent=2)
+                else:
+                    with open(jsonl_path, "r+", encoding="utf-8") as f:
+                        existing_data = json.load(f)
+                        existing_data.extend(batch_records)
+                        f.seek(0)
+                        json.dump(existing_data, f, ensure_ascii=False, indent=2)
+                        f.truncate()
+                
+                # 串流寫入 CSV
+                batch_df_out = pd.DataFrame(batch_records)
+                if not os.path.exists(csv_path):
+                    batch_df_out.to_csv(csv_path, index=False, encoding="utf-8")
+                else:
+                    batch_df_out.to_csv(csv_path, mode='a', header=False, index=False, encoding="utf-8")
+                
+                print(f"最終批次寫入完成，釋放記憶體")
+        
+        # 累加該語言的總時長
+        total_duration_lang += total_duration_split
+        
+        if total_valid_files == 0:
             print(f"警告：{language} - {split} 沒有有效的音檔記錄")
             continue
 
-        # 轉成 DataFrame 方便存檔
-        out_df = pd.DataFrame(records)
+        # 印出該 split 的總時長
+        hours_split = total_duration_split / 3600.0
+        print(f"完成 {language} - {split}: 音檔 {total_valid_files} 筆 | 索引：{jsonl_path} / {csv_path} | 總時長：{hours_split:.2f} 小時")
+    
+    # 印出該語言的總時長
+    hours_lang = total_duration_lang / 3600.0
+    print(f"完成語言 {language}: 總時長 {hours_lang:.2f} 小時")
+    
+    return total_duration_lang
 
-        # 存 JSON 和 CSV，檔名包含語言代碼
-        jsonl_path = os.path.join(PROCESSED_DIR, f"{language}_{split}.json")
-        csv_path = os.path.join(PROCESSED_DIR, f"{language}_{split}.csv")
-
-        with open(jsonl_path, "w", encoding="utf-8") as f:
-            json.dump(out_df.to_dict("records"), f, ensure_ascii=False, indent=2)
-
-        out_df.to_csv(csv_path, index=False, encoding="utf-8")
-
-        print(f"完成 {language} - {split}: 音檔 {len(out_df)} 筆 | 索引：{jsonl_path} / {csv_path}")
-
-
-def build_manifests(dataset_name: str,
-                    language: str,
-                    splits: List[str]) -> None:
+def build_manifests_batch(dataset_name: str,
+                         language: str,
+                         splits: List[str],
+                         batch_size: int = 1000) -> float:
     """
-    主要處理函數：自動偵測語言並處理所有資料
+    批次處理主要函數：自動偵測語言並使用批次處理所有資料
+    
+    參數
+    ----
+    batch_size : 批次處理大小，預設 1000
+    
+    回傳：整個資料集的有效音檔總時長（秒數）
     """
+    # 初始化整個資料集的總時長變數
+    total_duration_dataset = 0.0
+    
     # 固定從 data/raw 讀取資料集
     cv_root = os.path.join(RAW_DIR, dataset_name)              # e.g. data/raw/cv-corpus-22.0-2025-06-20
     
@@ -296,7 +379,7 @@ def build_manifests(dataset_name: str,
     if not os.path.isdir(cv_root):
         raise NotADirectoryError(f"找不到資料集目錄：{cv_root}\n請確認已將 Common Voice 資料集解壓到 data/raw/ 目錄下")
     
-    print(f"從資料集讀取：{cv_root}")
+    print(f"從資料集讀取：{cv_root}（批次大小：{batch_size}）")
     
     # 自動偵測語言或使用指定語言
     if language:
@@ -313,20 +396,26 @@ def build_manifests(dataset_name: str,
     # 處理每個語言
     for lang in languages:
         try:
-            process_language(dataset_name, lang, splits)
+            # 批次處理單一語言並獲取其總時長
+            duration_lang = process_language_batch(dataset_name, lang, splits, batch_size)
+            # 累加到資料集總時長
+            total_duration_dataset += duration_lang
         except Exception as e:
             print(f"處理語言 {lang} 時發生錯誤：{e}")
             continue
     
-    print(f"\n處理完成！共處理了 {len(languages)} 種語言：{languages}")
-
+    # 印出整個資料集的總時長
+    hours_dataset = total_duration_dataset / 3600.0
+    print(f"\n資料集總時長：{hours_dataset:.2f} 小時")
+    
+    return total_duration_dataset
 
 # =========================================================
 # 參數與進入點
 # =========================================================
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="將本地 Common Voice 檔案夾轉為訓練可用的 16kHz WAV 與索引檔"
+        description="將本地 Common Voice 檔案夾轉為訓練可用的 16kHz WAV 與索引檔（記憶體優化版）"
     )
     parser.add_argument(
         "--dataset_name",
@@ -346,6 +435,17 @@ def parse_args():
         default="train,dev,test",
         help="要處理的分割清單，以逗號分隔。例如：train,dev,test 或 validated（自動使用0.1s-30s時長過濾）"
     )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=1000,
+        help="批次處理大小，減少記憶體使用量。預設 1000（較小的值使用更少記憶體但處理較慢）"
+    )
+    parser.add_argument(
+        "--use_memory_optimized",
+        action="store_true",
+        help="啟用記憶體優化模式（批次處理 + 串流輸出）"
+    )
     return parser.parse_args()
 
 
@@ -364,15 +464,34 @@ def main():
         print(f"資料集路徑：data/raw/{args.dataset_name}/")
     print(f"分割：{splits}")
     print(f"時長過濾：0.1s - 30.0s（固定範圍）")
-    print("="*50)
     
-    # 執行
-    build_manifests(
-        dataset_name=args.dataset_name,
-        language=args.language if args.language else None,
-        splits=splits,
-    )
-    print("\n全部完成。你可以在 data/processed/ 找到索引與轉檔後音檔。")
+    # 根據參數選擇處理模式
+    if args.use_memory_optimized:
+        print(f"記憶體優化模式：啟用（批次大小：{args.batch_size}）")
+        print("="*60)
+        
+        # 執行批次處理模式
+        total_duration = build_manifests_batch(
+            dataset_name=args.dataset_name,
+            language=args.language if args.language else None,
+            splits=splits,
+            batch_size=args.batch_size
+        )
+    else:
+        print(f"標準模式（若記憶體不足，請使用 --use_memory_optimized）")
+        print("="*50)
+        
+        # 執行標準處理模式
+        total_duration = build_manifests(
+            dataset_name=args.dataset_name,
+            language=args.language if args.language else None,
+            splits=splits,
+        )
+    
+    # 印出總錄製時數
+    total_hours = total_duration / 3600.0
+    print(f"\n總錄製時數：{total_hours:.2f} 小時")
+    print("全部完成。你可以在 data/processed/ 找到索引與轉檔後音檔。")
 
 
 if __name__ == "__main__":

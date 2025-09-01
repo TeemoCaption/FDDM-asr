@@ -105,6 +105,47 @@ python scripts/preprocess.py --dataset_name "cv-corpus-22.0-2025-06-20"
 - 轉換音檔為 16kHz WAV 格式
 - 產生標準化的索引檔案
 - 自動進行時長過濾 (0.1s-30s)
+- **統計總錄製時數**：完成後顯示資料集總時長
+
+### 記憶體優化模式
+
+對於大型資料集，建議使用記憶體優化模式：
+```bash
+# 小型資料集（預設模式）
+python scripts/preprocess.py --dataset_name "cv-corpus-22.0-2025-06-20"
+
+# 大型資料集（記憶體優化模式）
+python scripts/preprocess.py --dataset_name "cv-corpus-22.0-2025-06-20" --use_memory_optimized --batch_size 500
+
+# 指定特定語言
+python scripts/preprocess.py --dataset_name "cv-corpus-22.0-2025-06-20" --language "zh-TW" --use_memory_optimized --batch_size 1000
+```
+
+**記憶體優化參數說明：**
+- `--use_memory_optimized`：啟用記憶體優化模式（批次處理 + 串流輸出）
+- `--batch_size`：批次處理大小（預設 1000，較小的值使用更少記憶體但處理較慢）
+- `--language`：指定處理特定語言（留空則自動偵測所有語言）
+
+**記憶體使用比較：**
+- **標準模式**：記憶體使用量與資料集大小成正比，適合小於 10,000 個檔案的資料集
+- **優化模式**：記憶體使用量固定在批次大小範圍內，適合任何大小的資料集
+
+**處理輸出範例：**
+```
+批次處理語言：zh-TW（批次大小：500）
+語言目錄：data/raw/cv-corpus-22.0-2025-06-20/zh-TW
+=== 批次處理 zh-TW - train ===
+處理批次 0-500（總共 15230）
+已寫入批次資料，釋放記憶體（當前批次記錄數：0）
+處理批次 500-1000（總共 15230）
+...
+完成 zh-TW - train: 音檔 15230 筆 | 索引：data/processed/zh-TW_train.json / data/processed/zh-TW_train.csv | 總時長：45.67 小時
+完成語言 zh-TW: 總時長 45.67 小時
+資料集總時長：45.67 小時
+
+總錄製時數：45.67 小時
+全部完成。你可以在 data/processed/ 找到索引與轉檔後音檔。
+```
 
 ### 4. Git 設定
 
@@ -132,8 +173,15 @@ pip install -r requirements.txt
 按照上方「資料準備」章節下載並放置 Common Voice 資料集到 `data/raw/` 目錄。
 
 ### 3. 自動化前處理
+
+#### 標準模式（適合小型資料集）
 ```bash
 python scripts/preprocess.py --dataset_name "cv-corpus-22.0-2025-06-20"
+```
+
+#### 記憶體優化模式（適合大型資料集）
+```bash
+python scripts/preprocess.py --dataset_name "cv-corpus-22.0-2025-06-20" --use_memory_optimized --batch_size 500
 ```
 
 ### 4. 訓練 Tokenizer
@@ -285,7 +333,9 @@ Best model saved at: ckpts/fddm_zhTW_base/best_model.pt
 - **資料集放置**: 將 Common Voice 資料集解壓後完整拖曳到 `data/raw/` 目錄中
 - **自動語言偵測**: 腳本會自動偵測資料集中的所有語言資料夾
 - **檔案路徑**: 處理後的檔案會包含語言前綴，例如 `zh-TW_train.json`
-- **記憶體管理**: 大模型訓練建議使用 GPU
+- **記憶體管理**: 大型資料集建議使用 `--use_memory_optimized` 參數
+- **批次處理**: 支援分批處理以避免記憶體溢出
+- **串流輸出**: 處理過程中即時寫入檔案，減少記憶體佔用
 - **超參數調整**: 建議從粗略範圍開始，逐步精細化
 - **模型驗證**: 訓練前先執行 sanity check 腳本
 - **Git 管理**: 已配置 `.gitignore` 保留 `data/raw/` 結構但忽略內容
