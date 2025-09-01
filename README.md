@@ -5,6 +5,22 @@
 ## 專案結構
 
 ```
+├── data/                      # 資料目錄
+│   ├── raw/                   # 原始資料集目錄（由 .gitkeep 保留結構）
+│   │   ├── cv-corpus-22.0-2025-06-20/  # Common Voice 資料集
+│   │   │   ├── zh-TW/         # 繁體中文資料
+│   │   │   │   ├── clips/     # 音檔資料夾
+│   │   │   │   ├── train.tsv  # 訓練集索引
+│   │   │   │   ├── dev.tsv    # 開發集索引
+│   │   │   │   └── test.tsv   # 測試集索引
+│   │   │   ├── en/           # 英文資料
+│   │   │   └── ... (其他語言)
+│   └── processed/             # 處理後的資料目錄
+│       ├── clips/             # 轉檔後的 16kHz WAV 檔案
+│       ├── zh-TW_train.json   # 繁體中文訓練集索引
+│       ├── zh-TW_dev.json     # 繁體中文開發集索引
+│       ├── zh-TW_test.json    # 繁體中文測試集索引
+│       └── ... (其他語言的索引檔案)
 ├── configs/                    # 模型與訓練設定檔
 │   ├── fddm_zhTW_base.yaml     # 主要訓練配置（繁體中文）
 │   ├── fddm_sweep.yaml         # 超參數搜尋配置
@@ -18,6 +34,7 @@
 ├── models/                     # 模型定義
 │   ├── acoustic_encoder.py     # 聲學特徵編碼器 (WavLM)
 │   ├── denoise_decoder.py      # 去噪解碼器 (支援 RoPE, FiLM)
+│   ├── evaluate.py             # 模型評估工具
 │   └── projection.py           # 特徵投影模組
 ├── sampler/                    # 採樣器
 │   └── jumpy_sampler.py        # 跳躍採樣器 (支援精確/快速模式)
@@ -26,8 +43,9 @@
 │   ├── tokenizer_train.py      # Tokenizer 訓練腳本
 │   ├── sanity_check_scheduler.py  # 擴散排程器測試腳本
 │   └── sanity_forward.py       # 模型前向傳播測試腳本
+├── ckpts/                     # 模型檢查點目錄
 ├── .vscode/                    # VS Code 設定檔
-├── .gitignore                 # Git 忽略設定
+├── .gitignore                 # Git 忽略設定（保留 data/raw 結構）
 ├── README.md                  # 專案說明文件
 ├── requirements.txt           # Python 套件依賴
 ├── train.py                   # 主要訓練腳本
@@ -44,31 +62,58 @@
 - **配置管理**: pyyaml
 - **科學計算**: numpy, scipy
 
-## 快速開始
+## 資料準備
 
-### 1. 安裝依賴
-```bash
-pip install -r requirements.txt
+### 1. 下載 Common Voice 資料集
+
+從 [Common Voice](https://commonvoice.mozilla.org/) 下載您需要的語言資料集，例如：
+- `cv-corpus-22.0-2025-06-20.tar.gz` (繁體中文)
+- `cv-corpus-22.0-2025-06-20.tar.gz` (英文)
+- 其他語言版本
+
+### 2. 放置資料集
+
+**將下載的壓縮檔案解壓後，完整拖曳資料集資料夾到專案的 `data/raw/` 目錄下**：
+
+```
+data/raw/cv-corpus-22.0-2025-06-20/
+├── zh-TW/           # 繁體中文資料
+│   ├── clips/       # 音檔
+│   ├── train.tsv    # 訓練集索引
+│   ├── dev.tsv      # 開發集索引
+│   └── test.tsv     # 測試集索引
+├── en/             # 英文資料
+├── ja/             # 日文資料
+└── ... (其他語言)
 ```
 
-### 2. 資料前處理
-```bash
-python scripts/preprocess.py
-```
-前處理會產生：
-- `data/processed/train.json`
-- `data/processed/validation.json`
-- `data/processed/test.json`
+**⚠️ 重要提醒**
+- 將**整個解壓後的資料集資料夾**拖到 `data/raw/` 目錄中
+- 不要修改資料集的原始結構
+- 腳本會自動偵測所有語言資料夾
 
-### 3. 訓練 Tokenizer
+### 3. 資料前處理
+
+執行自動化前處理腳本：
 ```bash
-python scripts/tokenizer_train.py --config configs/tokenizer_zhTW.yaml
+python scripts/preprocess.py --dataset_name "cv-corpus-22.0-2025-06-20"
 ```
 
-### 4. 開始訓練
-```bash
-python train.py --config configs/fddm_zhTW_base.yaml
-```
+腳本會自動：
+- 偵測所有語言資料夾
+- 處理所有分割 (train/dev/test)
+- 轉換音檔為 16kHz WAV 格式
+- 產生標準化的索引檔案
+- 自動進行時長過濾 (0.1s-30s)
+
+### 4. Git 設定
+
+專案已配置 `.gitignore`：
+- ✅ 保留 `data/raw/` 資料夾結構
+- ❌ 忽略 `data/raw/` 內的所有資料集內容
+- ❌ 忽略 `data/processed/` 處理後的檔案
+
+這樣可以安全地上傳專案程式碼而不會意外上傳大型資料檔案。
 
 訓練時會自動：
 - 載入 train/validation/test 資料集
@@ -76,19 +121,37 @@ python train.py --config configs/fddm_zhTW_base.yaml
 - 自動保存最佳驗證權重
 - 顯示完整的訓練日誌
 
+## 快速開始
+
+### 1. 安裝依賴
+```bash
+pip install -r requirements.txt
+```
+
+### 2. 準備資料集
+按照上方「資料準備」章節下載並放置 Common Voice 資料集到 `data/raw/` 目錄。
+
+### 3. 自動化前處理
+```bash
+python scripts/preprocess.py --dataset_name "cv-corpus-22.0-2025-06-20"
+```
+
+### 4. 訓練 Tokenizer
+```bash
+python scripts/tokenizer_train.py --config configs/tokenizer_zhTW.yaml
+```
+
 ### 5. 模型推論
 
 #### 單一音檔推論
 ```bash
-python inference.py --wav data/processed/clips/sample.wav --ckpt ckpts/fddm_zhTW_base/best_model.pt --main-config configs/fddm_zhTW_base.yaml --diffusion-config configs/diffusion.yaml --tokenizer data/tokenizer/zh-TW_A/spm_zhTW_A.model --T-infer 20 --r 5 --greedy
+python inference.py --wav data/processed/clips/zh-TW_test_sample.wav --ckpt ckpts/fddm_zhTW_base/best_model.pt --main-config configs/fddm_zhTW_base.yaml --diffusion-config configs/diffusion.yaml --tokenizer data/tokenizer/zh-TW_A/spm_zhTW_A.model --T-infer 20 --r 5 --greedy
 ```
 
 #### 批次推論
 ```bash
-python inference.py --csv data/processed/test.csv --ckpt ckpts/fddm_zhTW_base/best_model.pt --main-config configs/fddm_zhTW_base.yaml --diffusion-config configs/diffusion.yaml --tokenizer data/tokenizer/zh-TW_A/spm_zhTW_A.model --out-json results/infer_results.json
+python inference.py --csv data/processed/zh-TW_test.csv --ckpt ckpts/fddm_zhTW_base/best_model.pt --main-config configs/fddm_zhTW_base.yaml --diffusion-config configs/diffusion.yaml --tokenizer data/tokenizer/zh-TW_A/spm_zhTW_A.model --out-json results/infer_results.json
 ```
-
-## 訓練與評估
 
 ### 損失函數
 訓練使用兩種主要損失：
@@ -114,13 +177,13 @@ ckpts/fddm_zhTW_base/
 
 ## 設定說明
 
-### fddm_zhTW_base.yaml (主要訓練配置)
+> fddm_zhTW_base.yaml (主要訓練配置)
 ```yaml
 # 資料設定
 data:
-  train_json: data/processed/train.json
-  val_json: data/processed/validation.json
-  test_json: data/processed/test.json
+  train_json: data/processed/zh-TW_train.json      # 更新路徑
+  val_json: data/processed/zh-TW_dev.json           # 更新路徑
+  test_json: data/processed/zh-TW_test.json         # 更新路徑
   vocab_size: 8000
   max_len: 128
 
@@ -208,16 +271,16 @@ Best model saved at: ckpts/fddm_zhTW_base/best_model.pt
 
 ## 注意事項
 
-- **資料路徑**: 確保配置檔案中的資料路徑正確
-- **權重載入**: 推論時優先使用 `best_model.pt`
+- **資料集放置**: 將 Common Voice 資料集解壓後完整拖曳到 `data/raw/` 目錄中
+- **自動語言偵測**: 腳本會自動偵測資料集中的所有語言資料夾
+- **檔案路徑**: 處理後的檔案會包含語言前綴，例如 `zh-TW_train.json`
 - **記憶體管理**: 大模型訓練建議使用 GPU
 - **超參數調整**: 建議從粗略範圍開始，逐步精細化
 - **模型驗證**: 訓練前先執行 sanity check 腳本
-
-## 📈 性能監控
-
-訓練過程中監控的關鍵指標：
-- `loss_diff`: Diffusion KL 損失
-- `loss_fd`: 特徵去相關損失
-- `w_t`: 時間權重係數
-- `Train/Val/Test CER`: 字元錯誤率
+- **Git 管理**: 已配置 `.gitignore` 保留 `data/raw/` 結構但忽略內容
+- **Diffusion KL 損失**: KL[q(xt-1|xt,x0) || p_theta(xt-1|xt,c)]
+- **特徵去相關損失 (L_fd)**: 論文 3.3 節的跨模態對齊損失
+- **時間權重係數**: w_t
+- **訓練 CER**: 使用訓練資料樣本計算
+- **驗證 CER**: 模型選擇和早停依據
+- **測試 CER**: 最終模型性能評估
