@@ -482,7 +482,7 @@ def main():
         print("="*50)
         
         # 執行標準處理模式
-        total_duration = build_manifests(
+        total_duration = build_manifests_batch(  # 修正函數名稱為 build_manifests_batch，用於批次處理資料集
             dataset_name=args.dataset_name,
             language=args.language if args.language else None,
             splits=splits,
