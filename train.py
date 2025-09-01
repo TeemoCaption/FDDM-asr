@@ -43,7 +43,7 @@ from models.denoise_decoder import DenoisingTransformerDecoder
 from models.projection import SpeechProjector, TextEmbedding, TextProjector
 # 匯入評估函數
 from models.evaluate import (
-    calculate_cer, logits_to_text, evaluate_train_cer,
+    calculate_cer, logits_to_text,
     evaluate_validation_loss, evaluate_cer_with_full_sampling,
     evaluate_cer_with_jumpy_sampling, evaluate_cer_with_multi_sample
 )
@@ -313,60 +313,64 @@ def train_one_epoch(
     device: torch.device,
     cfg: Config,
     global_step: int,
-    scaler: amp.GradScaler = None,  # AMP 混合精度的縮放器（可為 None）
-    epoch: int = 1,                 # 目前第幾個 epoch：只用來顯示在進度條上
+    scaler: amp.GradScaler = None,   # AMP 混合精度的縮放器（可為 None）
+    epoch: int = 1,                  # 目前 epoch 編號（用於顯示）
+    print_epoch_summary: bool = True,  # 是否在函式結尾印出「本 epoch 平均訓練 loss」
 ) -> tuple[int, float]:
     """
-    單一 epoch 的訓練流程，含進度條與即時統計。
+    單一 epoch 的訓練流程，含進度條與即時統計；回傳 (global_step, avg_train_loss)。
 
     參數說明：
-        encoder  : 聲學編碼器（通常凍結，用於抽取條件 c）
-        decoder  : 擴散模型的去噪解碼器，輸出對 x_0 的 logits
-        s_proj   : 語音側投影頭（L_fd 用到）
-        t_embed  : 文本側嵌入頭（吃 logits 或 token，用於 L_fd）
-        t_proj   : 文本側投影頭（L_fd 用到）
-        scheduler: Diffusion 時間排程與 KL 計算的介面（Adapter）
-        loader   : 訓練 DataLoader
-        optimizer: 參數最佳化器
-        device   : torch.device
-        cfg      : 超參數設定（需包含 data/diffusion/lfd/log/optim 等欄位）
-        global_step: 目前全域步數（會被持續累加）
-        scaler   : AMP 的 GradScaler（若為 None 則使用 FP32 訓練）
-        epoch    : 目前 epoch 編號
-
+      encoder         聲學編碼器（通常凍結，只前向抽取條件 c）
+      decoder         擴散模型去噪解碼器，輸出對 x_0 的 logits
+      s_proj          語音側投影頭（L_fd 用到）
+      t_embed         文本側嵌入頭（吃 logits 或 token，用於 L_fd）
+      t_proj          文本側投影頭（L_fd 用到）
+      scheduler       Diffusion 時間排程與 KL 計算介面（Adapter）
+      loader          訓練 DataLoader
+      optimizer       參數最佳化器
+      device          torch.device
+      cfg             超參數設定（需含 data/diffusion/lfd/log/optim 等欄位）
+      global_step     目前全域步數（會累加）
+      scaler          AMP 的 GradScaler（None 代表使用 FP32）
+      epoch           當前 epoch（只用來顯示）
+      print_epoch_summary
+                       True 時，在函式結尾額外印出「本 epoch 平均訓練 loss」
     回傳：
-        (global_step, avg_train_loss)
+      (global_step, avg_train_loss)
     """
-    # 模式設定：通常 encoder 凍結評估模式，其餘訓練
-    encoder.eval()
+
+    # 模式設定：通常 encoder.eval()，其餘訓練
+    encoder.eval()          # 不更新 encoder，僅做條件抽取（節省記憶體與時間）
     decoder.train()
     s_proj.train()
     t_embed.train()
     t_proj.train()
 
-    pad_id   = cfg.data['pad_id']          # <pad> 的 token id（用於 mask）
-    T_total  = cfg.diffusion['T']          # 擴散總步數（訓練用）
-    log_every = cfg.log['log_every']       # 幾步列印一次訓練日誌
-    n_step_fd = cfg.lfd['n_step_fd']       # 每隔多少 step 加一次 L_fd
-    tau       = cfg.lfd.get('tau', 1.0)    # L_fd 的整體權重
-    lambda_off = cfg.lfd['lambda_offdiag'] # L_fd 的 off-diagonal 懲罰
+    # 讀取常用設定
+    pad_id     = cfg.data['pad_id']            # <pad> 的 token id（用於 mask）
+    T_total    = cfg.diffusion['T']            # 擴散總步數（訓練用）
+    log_every  = cfg.log['log_every']          # 幾步列印一次訓練日誌
+    n_step_fd  = cfg.lfd['n_step_fd']          # 每隔多少 step 加一次 L_fd
+    tau        = cfg.lfd.get('tau', 1.0)       # L_fd 的整體權重
+    lambda_off = cfg.lfd['lambda_offdiag']     # L_fd 的 off-diagonal 懲罰
 
     # 用 tqdm 包住 DataLoader；若環境沒裝 tqdm，_iter_with_progress 會自動退回印字
     pbar = _iter_with_progress(loader, desc=f"Epoch {epoch} [train]")
 
-    # 累積 epoch 平均損失
-    epoch_loss_sum = 0.0
-    epoch_step_cnt = 0
+    # 用於計算「epoch 平均訓練 loss」
+    epoch_loss_sum = 0.0    # 累積本 epoch 的 total loss（含 L_fd）
+    epoch_step_cnt = 0      # 本 epoch 的梯度更新步數
 
-    # 注意：pbar 產出的是「batch」，要拿到 batch_idx 就用 enumerate(pbar, 1)
+    # 逐 batch 訓練
     for batch_idx, batch in enumerate(pbar, 1):
+        # 取出語音與目標文字（x0）
         wave, x0 = batch                     # wave: [B, T_wav]；x0: [B, L]
         wave = wave.to(device)
         x0   = x0.to(device)
         B, L = x0.shape
 
-        # 取聲學條件 c = c_psi(s)；即便 encoder 不更新，也需要前向抽條件
-        # 使用 AMP 自動混合精度可加速並降低顯存（cuda 上生效）
+        # 前向抽條件 c = c_psi(s)；使用 AMP 減少顯存（cuda 上生效）
         with amp.autocast('cuda'):
             c, c_mask, _ = encoder(wave)     # c: [B, S, d], c_mask: [B, S]
 
@@ -380,7 +384,7 @@ def train_one_epoch(
         with amp.autocast('cuda'):
             logits = decoder(
                 xt, t, c,
-                x_mask=(x0 != pad_id),       # 排除 <pad>，避免模型學到 pad
+                x_mask=(x0 != pad_id),       # 避免模型學到 <pad>
                 c_mask=c_mask
             )                                # [B, L, V]
 
@@ -388,19 +392,20 @@ def train_one_epoch(
         x_mask = (x0 != pad_id)
 
         # 主要損失：Diffusion KL（論文 Eq.(6)）
+        # 注意：你的 Adapter 版本已支援 x_mask 以避免把 <pad> 納入 KL（與訓練目標一致）
         loss_diff = scheduler.kl_term(xt, x0, logits, t, x_mask)  # scalar
 
-        # 是否在此步套用跨模態對齊損失 L_fd（論文 §3.3）
+        # 是否在此步套用跨模態對齊損失 L_fd（論文 §3.3；總損失如式 (13)）
         apply_lfd = (global_step % n_step_fd) == 0
         loss = loss_diff
-        loss_fd_value = 0.0  # 只用於日誌顯示
+        loss_fd_value = 0.0  # 僅用於日誌顯示
         if apply_lfd:
-            # 文字側特徵：先將 logits（對 x_0 的分佈）經 t_embed/t_proj 投影
+            # 將對 x_0 的 logits 投影到文本特徵空間；語音條件亦投影到語音特徵空間
             with amp.autocast('cuda'):
                 z_text   = t_proj(t_embed(logits))   # [B, L, d_proj]
                 z_speech = s_proj(c)                 # [B, S, d_proj]
 
-            # 對齊語音/文字的時間長度以便計算 L_fd
+            # 時間維度對齊（S 可能與 L 不同）
             S = z_speech.size(1)
             if S >= L:
                 z_speech_aligned = z_speech[:, :L, :]
@@ -408,24 +413,23 @@ def train_one_epoch(
                 pad = z_speech[:, -1:, :].repeat(1, L - S, 1)
                 z_speech_aligned = torch.cat([z_speech, pad], dim=1)
 
-            # w_t = ∏_{s=1}^t (1-β_s)（對 batch 先取平均做 scalar 權重）
+            # w_t = ∏_{s=1}^t (1-β_s)（式 (13) 的權重；這裡取 batch mean 當 scalar）
             w_t = scheduler.w_t(t).mean()
 
-            # L_fd：跨模態特徵去相關化 + 對齊（詳見 losses/lfd_loss）
+            # L_fd：跨模態特徵去相關化 + 對齊（Barlow Twins 風格，見論文 §3.2）
             loss_fd = lfd_loss(z_speech_aligned, z_text, lambda_offdiag=lambda_off)
             loss_fd_value = float(loss_fd.detach().item())
 
-            # 將 L_fd 以 tau * w_t 的權重加到總損失
-            loss = loss + tau * w_t * loss_fd
+            # 將 L_fd 以 tau * w_t 的權重加到總損失（對齊論文式 (13)）
+            loss = loss + tau * w_t * loss_fd  # 參考：論文 (13) 與說明文字。:contentReference[oaicite:1]{index=1}
 
         # 反向傳播與最佳化
         optimizer.zero_grad(set_to_none=True)
-
         if scaler is not None:
             # AMP：縮放 loss 後反傳，避免半精度下的 underflow
             scaler.scale(loss).backward()
 
-            # 先取消縮放，再做梯度裁剪（包含所有可訓練模組）
+            # 先取消縮放再做梯度裁剪（包含 decoder / s_proj / t_embed / t_proj）
             trainable_params = (
                 list(decoder.parameters()) +
                 list(s_proj.parameters()) +
@@ -440,7 +444,6 @@ def train_one_epoch(
         else:
             # 純 FP32 模式
             loss.backward()
-
             trainable_params = (
                 list(decoder.parameters()) +
                 list(s_proj.parameters()) +
@@ -450,33 +453,40 @@ def train_one_epoch(
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=5.0)
             optimizer.step()
 
-        # 週期性日誌 + 進度條尾註
-        if (global_step % log_every) == 0:
-            loss_diff_val  = float(loss_diff.detach().item())
-            total_loss_val = float(loss.detach().item())
-            msg = f"step={global_step} loss_diff={loss_diff_val:.4f}"
-            if apply_lfd:
-                msg += f" loss_fd={loss_fd_value:.4f}"
-            msg += f" total_loss={total_loss_val:.4f}"
-            print(msg, flush=True)
+        # 每步更新進度條資訊（將詳細資訊放在進度條中）
+        loss_diff_val  = float(loss_diff.detach().item())
+        total_loss_val = float(loss.detach().item())
 
-            # 讓 tqdm 面板即時顯示目前損失
-            try:
-                pbar.set_postfix({
-                    "loss": f"{total_loss_val:.3f}",
-                    "diff": f"{loss_diff_val:.3f}",
-                    **({"lfd": f"{loss_fd_value:.3f}"} if apply_lfd else {})
-                })
-            except Exception:
-                pass
+        # 準備進度條顯示資訊
+        postfix_info = {
+            "step": global_step,
+            "loss": f"{total_loss_val:.3f}",
+            "diff": f"{loss_diff_val:.3f}",
+            "val_loss": "-",  # 訓練期間顯示待計算
+            "val_cer": "-"    # 訓練期間顯示待計算
+        }
 
-        # 累積 epoch 統計
+        if apply_lfd:
+            postfix_info["lfd"] = f"{loss_fd_value:.3f}"
+
+        # 更新進度條（每步都更新）
+        try:
+            pbar.set_postfix(postfix_info)
+        except Exception:
+            pass
+
+        # 累積 epoch 統計（用於平均 loss）
         epoch_loss_sum += float(loss.detach().item())
         epoch_step_cnt += 1
         global_step += 1
 
-    # 回傳平均訓練損失（可搭配你在 main() 的列印）
-    avg_loss = (epoch_loss_sum / epoch_step_cnt) if epoch_step_cnt > 0 else 0.0
+    # 計算並回傳「本 epoch 平均訓練 loss」
+    avg_loss = (epoch_loss_sum / max(1, epoch_step_cnt))
+
+    # 可選：在函式結尾印出總結（避免與 main() 的列印重複，預設關閉）
+    if print_epoch_summary:
+        print(f"[Summary] Epoch {epoch} Avg Train Loss: {avg_loss:.4f}", flush=True)
+
     return global_step, avg_loss
 
 
@@ -608,12 +618,7 @@ def main():
             scaler  # 傳入 AMP GradScaler
         )
         
-        # 每個 epoch 結束後進行訓練 CER 評估
-        train_cer = evaluate_train_cer(
-            encoder, decoder, s_proj, t_embed, t_proj,
-            scheduler, train_loader, device, cfg, tokenizer, max_batches=5
-        )
-        print(f"Epoch {epoch} Train CER: {train_cer:.4f} | Train Loss: {train_loss:.4f}")
+        print(f"Epoch {epoch} Train Loss: {train_loss:.4f}")
         
         # 每個 epoch 結束後進行驗證
         if val_loader is not None:
@@ -626,6 +631,18 @@ def main():
                 scheduler, val_loader, device, cfg
             )
             print(f"Epoch {epoch} Validation CER: {val_cer:.4f} | Validation Loss: {val_loss:.4f}")
+            
+            # 更新進度條顯示驗證資訊
+            try:
+                # 為進度條添加驗證資訊
+                pbar.set_postfix({
+                    "epoch": epoch,
+                    "train_loss": f"{train_loss:.3f}",
+                    "val_loss": f"{val_loss:.3f}",
+                    "val_cer": f"{val_cer:.3f}"
+                })
+            except Exception:
+                pass
             
             # 檢查是否為最佳驗證 CER
             if val_cer < best_val_cer:
